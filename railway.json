@@ -1,0 +1,9 @@
+{
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "pip install pyTelegramBotAPI requests"
+  },
+  "deploy": {
+    "command": "python bot.py"
+  }
+}
