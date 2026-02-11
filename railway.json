@@ -1,7 +1,12 @@
 {
   "build": {
     "builder": "NIXPACKS",
-    "buildCommand": "pip install pyTelegramBotAPI requests"
+    "buildCommand": "pip install pyTelegramBotAPI==4.14.0 requests==2.31.0",
+    "nixpacksConfig": {
+      "python": {
+        "version": "3.11"
+      }
+    }
   },
   "deploy": {
     "command": "python bot.py"
