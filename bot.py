@@ -1,10 +1,9 @@
 import telebot
 from telebot import types
 import os
-from datetime import datetime
 
-# Bot token
-BOT_TOKEN = os.environ.get('BOT_TOKEN', "8200926398:AAEeHOtOWRXxeBTRGGm14vUR1ymczX3ZoZY")
+# Bot token (Railway'da environment variable dan olinadi)
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Chempionatlar
@@ -16,73 +15,38 @@ LEAGUES = {
     "BL1": "🇩🇪 Germaniya"
 }
 
-# O'yinlar (test ma'lumotlari)
-MATCHES = {
-    "PL": [
-        {"home": "Manchester City", "away": "Arsenal", "time": "21:45", "prob": 67},
-        {"home": "Liverpool", "away": "Chelsea", "time": "20:00", "prob": 58}
-    ],
-    "PD": [
-        {"home": "Real Madrid", "away": "Barcelona", "time": "23:00", "prob": 55},
-        {"home": "Atletico Madrid", "away": "Sevilla", "time": "21:15", "prob": 62}
-    ],
-    "FL1": [
-        {"home": "PSG", "away": "Marseille", "time": "22:00", "prob": 71},
-    ],
-    "SA": [
-        {"home": "Inter", "away": "Milan", "time": "21:45", "prob": 52},
-        {"home": "Juventus", "away": "Napoli", "time": "20:00", "prob": 60}
-    ],
-    "BL1": [
-        {"home": "Bayern", "away": "Dortmund", "time": "20:30", "prob": 65},
-    ]
-}
-
 @bot.message_handler(commands=['start'])
 def start(message):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    
     for code, name in LEAGUES.items():
-        btn = types.InlineKeyboardButton(name, callback_data=f"league_{code}")
-        markup.add(btn)
+        markup.add(types.InlineKeyboardButton(name, callback_data=f"league_{code}"))
     
-    text = """
-⚽ *FUTBOL TAHLIL BOTI*
-
-24 soat ichidagi o'yinlar:
-🏴󠁧󠁢󠁥󠁮󠁧󠁿 Angliya
-🇪🇸 Ispaniya
-🇫🇷 Fransiya
-🇮🇹 Italiya
-🇩🇪 Germaniya
-
-👇 Chempionatni tanlang:
-    """
-    
-    bot.send_message(message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
+    bot.send_message(
+        message.chat.id,
+        "⚽ *FUTBOL BOTI ISHGA TUSHDI!*\n\n24 soat ichidagi o'yinlar uchun chempionatni tanlang:",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
 
 @bot.callback_query_handler(func=lambda call: True)
 def callback(call):
     if call.data.startswith("league_"):
         code = call.data.replace("league_", "")
         name = LEAGUES.get(code, "Noma'lum")
-        matches = MATCHES.get(code, [])
         
-        if not matches:
-            bot.send_message(call.message.chat.id, f"❌ {name} da o'yin yo'q")
-            bot.answer_callback_query(call.id)
-            return
+        # Test o'yinlari
+        matches = {
+            "PL": "🏆 Manchester City vs Arsenal (21:45)\n📊 Favorit: Man City 67%\n\n🏆 Liverpool vs Chelsea (20:00)\n📊 Favorit: Liverpool 58%",
+            "PD": "🏆 Real Madrid vs Barcelona (23:00)\n📊 Favorit: Real Madrid 55%",
+            "FL1": "🏆 PSG vs Marseille (22:00)\n📊 Favorit: PSG 71%",
+            "SA": "🏆 Inter vs Milan (21:45)\n📊 Favorit: Inter 52%",
+            "BL1": "🏆 Bayern vs Dortmund (20:30)\n📊 Favorit: Bayern 65%"
+        }
         
-        text = f"🏆 *{name}*\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        
-        for match in matches:
-            text += f"⚔️ *{match['home']}* vs *{match['away']}*\n"
-            text += f"⏰ {match['time']}\n"
-            text += f"📊 *Favorit:* {match['home']} ({match['prob']}%)\n"
-            text += f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        
+        text = f"🏆 *{name}*\n━━━━━━━━━━━━━━━\n\n{matches.get(code, '24 soat ichida o\'yin yo\'q')}"
         bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
-        bot.answer_callback_query(call.id)
+    
+    bot.answer_callback_query(call.id)
 
 print("✅ Bot ishga tushdi!")
 bot.infinity_polling()
