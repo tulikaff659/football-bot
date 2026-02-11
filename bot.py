@@ -4,8 +4,8 @@ import logging
 import aiohttp
 from datetime import datetime, timedelta
 from aiohttp import web
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
 # ---------- SOZLAMALAR ----------
 logging.basicConfig(
@@ -13,177 +13,165 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# RapidAPI kaliti va host – MUHIT OʻZGARUVCHISIDAN OLINADI
+# RapidAPI kaliti va host (MUHIT OʻZGARUVCHISIDAN)
 RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "api-football-v1.p.rapidapi.com"
 
-# Top 5 chempionat IDlari (API-FOOTBALL boʻyicha)
+# Top 5 chempionat (ID, nom, bayroq)
 TOP_LEAGUES = {
-    39: "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga (Angliya)",
-    140: "🇪🇸 La Liga (Ispaniya)",
-    135: "🇮🇹 Seriya A (Italiya)",
-    78: "🇩🇪 Bundesliga (Germaniya)",
-    61: "🇫🇷 Liga 1 (Fransiya)"
+    39: {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
+    140: {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
+    135: {"name": "🇮🇹 Seriya A", "country": "Italiya"},
+    78: {"name": "🇩🇪 Bundesliga", "country": "Germaniya"},
+    61: {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
 }
 
-# ---------- 24 SOAT ICHIDAGI OʻYINLARNI OLISH ----------
-async def fetch_todays_matches():
-    """API-FOOTBALL orqali bugun va ertangi oʻyinlarni olish"""
-    
-    if not RAPIDAPI_KEY:
-        logger.warning("RAPIDAPI_KEY topilmadi, statik maʼlumot ishlatiladi")
-        return get_static_matches()
+# ---------- INLINE TUGMALAR ----------
+def get_leagues_keyboard():
+    """5 ta chempionat uchun inline tugmalar yaratish"""
+    keyboard = []
+    for league_id, data in TOP_LEAGUES.items():
+        keyboard.append([InlineKeyboardButton(
+            text=data["name"],
+            callback_data=f"league_{league_id}"
+        )])
+    return InlineKeyboardMarkup(keyboard)
 
+# ---------- API ORQALI OʻYINLARNI OLISH ----------
+async def fetch_matches_by_league(league_id: int):
+    """Berilgan liga ID boʻyicha 24 soat ichidagi oʻyinlarni olish"""
+    if not RAPIDAPI_KEY:
+        logger.error("RAPIDAPI_KEY topilmadi!")
+        return None
+    
     today = datetime.now().strftime("%Y-%m-%d")
     tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     
+    url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
     headers = {
         "x-rapidapi-key": RAPIDAPI_KEY,
         "x-rapidapi-host": RAPIDAPI_HOST
     }
-    
-    all_matches = []
+    params = {
+        "league": league_id,
+        "season": "2024",  # 2024/2025 mavsum
+        "from": today,
+        "to": tomorrow,
+        "timezone": "Asia/Tashkent"
+    }
     
     try:
         async with aiohttp.ClientSession() as session:
-            for league_id, league_name in TOP_LEAGUES.items():
-                url = "https://api-football-v1.p.rapidapi.com/v3/fixtures"
-                params = {
-                    "league": league_id,
-                    "season": "2024",  # Joriy mavsum
-                    "from": today,
-                    "to": tomorrow,
-                    "timezone": "Asia/Tashkent"
-                }
-                
-                async with session.get(url, headers=headers, params=params) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get("response"):
-                            for match in data["response"]:
-                                fixture = match["fixture"]
-                                teams = match["teams"]
-                                goals = match["goals"]
-                                status = match["fixture"]["status"]["short"]
-                                
-                                # Statusni oʻzbekchalashtirish
-                                status_uz = "⏳ Tayinlangan"
-                                if status == "LIVE":
-                                    status_uz = "🟢 Jonli"
-                                elif status == "HT":
-                                    status_uz = "🟡 Tanaffus"
-                                elif status == "FT":
-                                    status_uz = "✅ Tugagan"
-                                elif status == "PEN":
-                                    status_uz = "⚪ Penaltilar"
-                                
-                                match_info = {
-                                    "league": league_name,
-                                    "home": teams["home"]["name"],
-                                    "away": teams["away"]["name"],
-                                    "date": fixture["date"][:10],
-                                    "time": fixture["date"][11:16],
-                                    "status": status_uz,
-                                    "score_home": goals["home"],
-                                    "score_away": goals["away"],
-                                    "event_id": fixture["id"]
-                                }
-                                all_matches.append(match_info)
-                    else:
-                        logger.error(f"API xatolik {league_name}: {resp.status}")
-                    
-                    # Rate limit uchun pauza (bepul rejada 10 req/min)
-                    await asyncio.sleep(6)
-                    
+            async with session.get(url, headers=headers, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data.get("response", [])
+                else:
+                    logger.error(f"API xatolik: {resp.status} - Liga {league_id}")
+                    return None
     except Exception as e:
         logger.error(f"Soʻrovda xatolik: {e}")
-        return get_static_matches()
-    
-    return all_matches if all_matches else get_static_matches()
+        return None
 
-# ---------- STATIK ZAXIRA (API ISHLAMASA) ----------
-def get_static_matches():
-    """Agar API vaqtincha ishlamasa, namuna maʼlumot"""
-    today = datetime.now().strftime("%d.%m.%Y")
-    return [
-        {
-            "league": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga (Angliya)",
-            "home": "Manchester City",
-            "away": "Liverpool",
-            "date": today,
-            "time": "19:45",
-            "status": "⏳ Tayinlangan",
-            "score_home": None,
-            "score_away": None,
-            "event_id": 1145515
-        },
-        {
-            "league": "🇪🇸 La Liga (Ispaniya)",
-            "home": "Real Madrid",
-            "away": "Barcelona",
-            "date": today,
-            "time": "21:00",
-            "status": "⏳ Tayinlangan",
-            "score_home": None,
-            "score_away": None,
-            "event_id": 1145516
-        }
-    ]
-
-# ---------- XABAR FORMATLASH ----------
-def format_matches_message(matches):
+# ---------- OʻYINLARNI FORMATLASH ----------
+def format_matches(matches, league_name):
     """Oʻyinlar roʻyxatini chiroyli matnga aylantirish"""
     if not matches:
-        return "⚽ Bugun va ertaga top 5 chempionatlarda oʻyinlar yoʻq."
+        return f"⚽ {league_name} – 24 soat ichida oʻyinlar yoʻq."
     
-    message = f"📅 **{datetime.now().strftime('%d.%m.%Y')} – 24 soatlik oʻyinlar**\n\n"
-    message += "⏰ Toshkent vaqti boʻyicha\n\n"
+    text = f"🏆 **{league_name}**\n"
+    text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – ertaga\n"
+    text += "━" * 35 + "\n"
     
-    current_league = None
     for match in matches:
-        if match["league"] != current_league:
-            current_league = match["league"]
-            message += f"\n🏆 **{current_league}**\n"
-            message += "━" * 35 + "\n"
+        fixture = match["fixture"]
+        teams = match["teams"]
+        goals = match["goals"]
+        status = fixture["status"]["short"]
         
-        if match["score_home"] is not None and match["score_away"] is not None:
-            score = f" **{match['score_home']}:{match['score_away']}**"
+        # Vaqt (Toshkent vaqti)
+        match_time = fixture["date"][11:16]
+        
+        # Statusga qarab belgi
+        if status == "LIVE":
+            status_icon = "🟢 Jonli"
+            score = f"{goals['home']}:{goals['away']}"
+        elif status == "HT":
+            status_icon = "🟡 Tanaffus"
+            score = f"{goals['home']}:{goals['away']}"
+        elif status == "FT":
+            status_icon = "✅ Tugagan"
+            score = f"**{goals['home']}:{goals['away']}**"
+        elif status == "PEN":
+            status_icon = "⚪ Penaltilar"
+            score = f"{goals['home']}:{goals['away']}"
         else:
-            score = f" {match['time']}"
+            status_icon = "⏳"
+            score = match_time
         
-        status_icon = match["status"]
-        message += f"• {match['home']} – {match['away']}{score}  {status_icon}\n"
+        home = teams["home"]["name"]
+        away = teams["away"]["name"]
+        
+        text += f"• {home} – {away}  {score}  {status_icon}\n"
     
-    message += "\n📊 *Maʼlumotlar API-FOOTBALL (RapidAPI) orqali olinmoqda*"
-    return message
+    text += "\n📊 *API-FOOTBALL orqali real vaqt*"
+    return text
 
 # ---------- TELEGRAM HANDLERLAR ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start komandasi"""
+    """Start komandasi – liga tanlash tugmalari"""
     user = update.effective_user
     await update.message.reply_text(
         f"👋 Assalomu alaykum, {user.first_name}!\n"
-        "⚽ Bugungi top 5 chempionat oʻyinlarini yuklayapman..."
+        "Quyidagi chempionatlardan birini tanlang:\n"
+        "24 soat ichidagi oʻyinlarni koʻrasiz.",
+        reply_markup=get_leagues_keyboard()
     )
-    
-    matches = await fetch_todays_matches()
-    message = format_matches_message(matches)
-    await update.message.reply_text(message, parse_mode="Markdown")
 
-async def matches(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Oʻyinlar komandasi"""
-    msg = await update.message.reply_text("⏳ Maʼlumotlarni yuklayapman...")
-    matches = await fetch_todays_matches()
-    message = format_matches_message(matches)
-    await msg.edit_text(message, parse_mode="Markdown")
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inline tugma bosilganda ishlaydi"""
+    query = update.callback_query
+    await query.answer()
+    
+    # Callback ma'lumotdan liga ID sini olish
+    callback_data = query.data
+    if callback_data.startswith("league_"):
+        league_id = int(callback_data.split("_")[1])
+        league_info = TOP_LEAGUES.get(league_id)
+        if not league_info:
+            await query.edit_message_text("❌ Notoʻgʻri tanlov.")
+            return
+        
+        # Yuklanayotgani haqida xabar
+        await query.edit_message_text(
+            f"⏳ {league_info['name']} – oʻyinlar yuklanmoqda..."
+        )
+        
+        # API dan ma'lumot olish
+        matches = await fetch_matches_by_league(league_id)
+        
+        if matches is None:
+            text = "❌ API bilan bogʻlanishda xatolik yuz berdi.\nQayta urinib koʻring."
+        else:
+            text = format_matches(matches, league_info['name'])
+        
+        # Xabarni yangilash va tugmalarni qayta koʻrsatish
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=get_leagues_keyboard()
+        )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Har qanday xabarga javob"""
-    await matches(update, context)
+    """Har qanday matnli xabarga tugmalar bilan javob"""
+    await update.message.reply_text(
+        "Quyidagi chempionatlardan birini tanlang:",
+        reply_markup=get_leagues_keyboard()
+    )
 
-# ---------- WEB SERVER (RAILWAY UCHUN) ----------
+# ---------- WEB SERVER (Railway uchun) ----------
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (API-FOOTBALL)")
+    return web.Response(text="✅ Futbol bot ishlamoqda (API-FOOTBALL)")
 
 async def run_web_server():
     app = web.Application()
@@ -199,13 +187,14 @@ async def run_web_server():
 async def run_bot():
     token = os.environ.get("BOT_TOKEN")
     if not token:
-        logger.error("BOT_TOKEN topilmadi! Bot ishga tushmaydi.")
+        logger.error("BOT_TOKEN topilmadi!")
         return
     
     application = Application.builder().token(token).build()
+    
+    # Handlerlar
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("matches", matches))
-    application.add_handler(CommandHandler("oyinlar", matches))
+    application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     await application.initialize()
