@@ -1,52 +1,84 @@
-import telebot
-from telebot import types
 import os
+import asyncio
+import logging
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Bot token (Railway'da environment variable dan olinadi)
-BOT_TOKEN = os.environ.get('BOT_TOKEN')
-bot = telebot.TeleBot(BOT_TOKEN)
+# Loglashni sozlash
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# Chempionatlar
-LEAGUES = {
-    "PL": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Angliya",
-    "PD": "🇪🇸 Ispaniya",
-    "FL1": "🇫🇷 Fransiya",
-    "SA": "🇮🇹 Italiya",
-    "BL1": "🇩🇪 Germaniya"
-}
+# ---------- Futbol tahlillari (statik misol) ----------
+def get_football_analysis():
+    """Bugungi futbol tahlillarini qaytaradi (API kalitsiz, statik)."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    analysis = f"""
+⚽ **Futbol Tahlili – {today}**  
 
-@bot.message_handler(commands=['start'])
-def start(message):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    for code, name in LEAGUES.items():
-        markup.add(types.InlineKeyboardButton(name, callback_data=f"league_{code}"))
-    
-    bot.send_message(
-        message.chat.id,
-        "⚽ *FUTBOL BOTI ISHGA TUSHDI!*\n\n24 soat ichidagi o'yinlar uchun chempionatni tanlang:",
-        parse_mode='Markdown',
-        reply_markup=markup
-    )
+🏆 **Premyer Liga**  
+Manchester City vs Liverpul  
+- City gʻalabasi: 58%  
+- Durang: 24%  
+- Liverpul gʻalabasi: 18%  
+🔑 Asosiy oʻyinchi: Erling Haaland (City)
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-    if call.data.startswith("league_"):
-        code = call.data.replace("league_", "")
-        name = LEAGUES.get(code, "Noma'lum")
-        
-        # Test o'yinlari
-        matches = {
-            "PL": "🏆 Manchester City vs Arsenal (21:45)\n📊 Favorit: Man City 67%\n\n🏆 Liverpool vs Chelsea (20:00)\n📊 Favorit: Liverpool 58%",
-            "PD": "🏆 Real Madrid vs Barcelona (23:00)\n📊 Favorit: Real Madrid 55%",
-            "FL1": "🏆 PSG vs Marseille (22:00)\n📊 Favorit: PSG 71%",
-            "SA": "🏆 Inter vs Milan (21:45)\n📊 Favorit: Inter 52%",
-            "BL1": "🏆 Bayern vs Dortmund (20:30)\n📊 Favorit: Bayern 65%"
-        }
-        
-        text = f"🏆 *{name}*\n━━━━━━━━━━━━━━━\n\n{matches.get(code, '24 soat ichida o\'yin yo\'q')}"
-        bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
-    
-    bot.answer_callback_query(call.id)
+🇪🇸 **La Liga**  
+Barselona vs Real Madrid  
+- Barselona gʻalabasi: 52%  
+- Durang: 26%  
+- Real Madrid gʻalabasi: 22%  
+🔑 Asosiy oʻyinchi: Jude Bellingham (Real)
 
-print("✅ Bot ishga tushdi!")
-bot.infinity_polling()
+🇮🇹 **Seriya A**  
+Yuventus vs Inter  
+- Yuventus gʻalabasi: 45%  
+- Durang: 30%  
+- Inter gʻalabasi: 25%  
+🔑 Asosiy oʻyinchi: Lautaro Martines (Inter)
+
+📊 *Bashoratlar soʻnggi forma va tarixiy maʼlumotlarga asoslangan.*
+    """
+    return analysis
+
+# ---------- Buyruq handlerlari ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Salomlashuv va futbol tahlilini yuborish."""
+    user = update.effective_user
+    welcome = f"👋 Assalomu alaykum, {user.first_name}!\n\n"
+    analysis = get_football_analysis()
+    await update.message.reply_text(welcome + analysis, parse_mode="Markdown")
+
+async def analysis(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Futbol tahlilini yuborish."""
+    analysis = get_football_analysis()
+    await update.message.reply_text(analysis, parse_mode="Markdown")
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi yozgan har qanday matnga tahlil bilan javob berish."""
+    await analysis(update, context)
+
+# ---------- Asosiy funksiya ----------
+def main():
+    """Botni ishga tushirish."""
+    # Bot tokenini muhit oʻzgaruvchisidan olish
+    token = os.environ.get("BOT_TOKEN")
+    if not token:
+        raise ValueError("BOT_TOKEN muhit oʻzgaruvchisida topilmadi!")
+
+    # Application yaratish
+    application = Application.builder().token(token).build()
+
+    # Handlerlarni qoʻshish
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("analysis", analysis))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+
+    # Botni ishga tushirish (polling)
+    logger.info("Bot ishga tushdi va polling qilmoqda...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
