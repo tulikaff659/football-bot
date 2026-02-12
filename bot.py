@@ -332,7 +332,8 @@ def format_lineups(data):
         for p in data['home_lineup'][:11]:
             pos = p.get('position', '')
             icon = "🥅" if "Goalkeeper" in pos else "🛡️" if "Defender" in pos else "⚡" if "Midfielder" in pos else "🎯"
-            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', 'Noma\'lum')} ({pos})\n"
+            # F-STRING ICHIDA BACKSLASH YO'Q: double quote ishlatildi
+            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', "Noma'lum")} ({pos})\n"
     else: msg += "❌ Tarkib e'lon qilinmagan\n"
     msg += "\n🛣️ **" + data['away_team'] + "**"
     if data['away_formation']: msg += f" ({data['away_formation']})"
@@ -342,7 +343,7 @@ def format_lineups(data):
         for p in data['away_lineup'][:11]:
             pos = p.get('position', '')
             icon = "🥅" if "Goalkeeper" in pos else "🛡️" if "Defender" in pos else "⚡" if "Midfielder" in pos else "🎯"
-            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', 'Noma\'lum')} ({pos})\n"
+            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', "Noma'lum")} ({pos})\n"
     else: msg += "❌ Tarkib e'lon qilinmagan\n"
     return msg
 
@@ -561,7 +562,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lineups_avail = lineups and (lineups['home_lineup'] or lineups['away_lineup'])
         kb = build_match_detail_keyboard(mid, subscribed, lineups_avail)
 
-        # Uzun matnni bo'lib yuborish
         if len(msg) > 4096:
             await q.edit_message_text(msg[:4090] + "...", parse_mode="Markdown", reply_markup=kb)
             await context.bot.send_message(uid, f"📎 **Tahlilning davomi:**\n\n{msg[4090:]}", parse_mode="Markdown")
@@ -629,7 +629,6 @@ async def notification_scheduler(app: Application):
                 groups[mid]["users"].append({"id": uid, "n1": n1, "n15": n15, "nl": nl})
             for mid, g in groups.items():
                 delta = (g["time"] - datetime.utcnow()).total_seconds() / 60
-                # 1 soat
                 if not g["n1_flag"] and any(not u["n1"] for u in g["users"]):
                     if 55 <= delta <= 65:
                         for u in g["users"]:
@@ -642,7 +641,6 @@ async def notification_scheduler(app: Application):
                                 except Exception as e:
                                     logger.error(f"1h notification error: {e}")
                         g["n1_flag"] = True
-                        # Lineups (faqat bir marta)
                         if not g["nl_flag"] and any(not u["nl"] for u in g["users"]):
                             lu = await fetch_match_lineups(mid)
                             if lu and (lu['home_lineup'] or lu['away_lineup']):
@@ -670,7 +668,6 @@ async def notification_scheduler(app: Application):
                                         except Exception as e:
                                             logger.error(f"Lineups notification error: {e}")
                             g["nl_flag"] = True
-                # 15 daqiqa
                 if not g["n15_flag"] and any(not u["n15"] for u in g["users"]):
                     if 10 <= delta <= 20:
                         links = generate_match_links(mid, g['home'], g['away'], g['league'])
@@ -759,11 +756,12 @@ async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     u = update.effective_user
     if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
     async with aiosqlite.connect(DB_PATH) as db:
-        users = (await db.execute("SELECT COUNT(*) FROM users")).fetchone()[0]
-        refs = (await db.execute("SELECT COUNT(*) FROM referrals")).fetchone()[0]
-        bal = (await db.execute("SELECT SUM(balance) FROM users")).fetchone()[0] or 0
-        wd_cnt = (await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='completed'")).fetchone()[0]
-        wd_sum = (await db.execute("SELECT SUM(amount) FROM withdrawals WHERE status='completed'")).fetchone()[0] or 0
+        db.row_factory = aiosqlite.Row
+        users = (await db.execute_fetchall("SELECT COUNT(*) FROM users"))[0][0]
+        refs = (await db.execute_fetchall("SELECT COUNT(*) FROM referrals"))[0][0]
+        bal = (await db.execute_fetchall("SELECT SUM(balance) FROM users"))[0][0] or 0
+        wd_cnt = (await db.execute_fetchall("SELECT COUNT(*) FROM withdrawals WHERE status='completed'"))[0][0]
+        wd_sum = (await db.execute_fetchall("SELECT SUM(amount) FROM withdrawals WHERE status='completed'"))[0][0] or 0
     text = f"📊 **Bot statistikasi**\n\n👥 Foydalanuvchilar: {users}\n🔗 Referallar: {refs}\n💰 Jami balans: {bal:,} soʻm\n💸 Yechimlar soni: {wd_cnt}\n💵 Jami yechilgan: {wd_sum:,} soʻm"
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -781,7 +779,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Final version)")
+    return web.Response(text="✅ Bot ishlamoqda (F-string backslash fixed)")
 
 async def run_web_server():
     app = web.Application()
@@ -813,7 +811,7 @@ async def run_bot():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Final versiya)")
+    logger.info("🤖 Bot ishga tushdi! (F-string backslash fixed)")
     asyncio.create_task(notification_scheduler(app))
     while True:
         await asyncio.sleep(3600)
