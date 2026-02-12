@@ -210,6 +210,7 @@ def get_leagues_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 def build_matches_keyboard(matches, league_code):
+    """Oʻyinlar roʻyxati – faqat oʻyin nomi tugmalari, kuzatish tugmasi yoʻq"""
     keyboard = []
     for match in matches[:10]:
         home = match["homeTeam"]["name"]
@@ -222,10 +223,17 @@ def build_matches_keyboard(matches, league_code):
         button_text = f"{home} – {away} ({date_str})"
         callback_data = f"match_{match_id}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-        
-        # 🔔 Obuna bo'lish tugmasi
-        keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
     
+    keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
+    return InlineKeyboardMarkup(keyboard)
+
+def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False):
+    """Oʻyin tahlili sahifasidagi tugmalar"""
+    keyboard = []
+    if is_subscribed:
+        keyboard.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{match_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
     keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -242,6 +250,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    user_id = update.effective_user.id
 
     # ---------- Ligalarga qaytish ----------
     if data == "leagues":
@@ -270,7 +279,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = build_matches_keyboard(matches, league_code)
         await query.edit_message_text(
             f"🏆 **{league_info['name']}** – {DAYS_AHEAD} kun ichidagi oʻyinlar:\n\n"
-            "🔔 **Kuzatish** tugmasini bosib, oʻyin haqida bildirishnoma olishingiz mumkin.",
+            "Oʻyin ustiga bosing, tahlil va kuzatish imkoniyati.",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
@@ -287,20 +296,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{match_id}`\n📝 **Tahlil:**\n{text}\n\n🕐 Qoʻshilgan: {date_str}"
         else:
             msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{match_id}`\n📊 Hozircha tahlil mavjud emas."
-            if await is_admin(update.effective_user.id):
+            if await is_admin(user_id):
                 msg += f"\n\n💡 Admin: `/addanalysis {match_id} <tahlil>`"
-        await query.edit_message_text(msg, parse_mode="Markdown")
-        # Orqaga qaytish tugmasi
-        back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")]])
-        await query.message.reply_text("Boshqa ligaga oʻtish:", reply_markup=back)
+        
+        # Foydalanuvchi obuna bo'lganmi?
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute('SELECT 1 FROM subscriptions WHERE user_id = ? AND match_id = ?', (user_id, match_id)) as cursor:
+                is_subscribed = await cursor.fetchone() is not None
+        
+        keyboard = build_match_detail_keyboard(match_id, is_subscribed)
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
     # ---------- Obuna bo'lish ----------
     if data.startswith("subscribe_"):
         match_id = int(data.split("_")[1])
-        user_id = update.effective_user.id
-
-        # API dan match ma'lumotini olish
         result = await fetch_match_by_id(match_id)
         if "error" in result:
             await query.edit_message_text(result["error"])
@@ -313,12 +323,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await subscribe_user(user_id, match_id, match_time, home, away)
         await query.edit_message_text(
             f"✅ Siz **{home} – {away}** oʻyiniga obuna boʻldingiz!\n\n"
-            f"⏰ Eslatmalar: 1 soat va 15 daqiqa qolganda, shuningdek tarkib eʼlon qilinganda xabar beramiz.",
+            f"⏰ Eslatmalar: 1 soat va 15 daqiqa qolganda, tarkib eʼlon qilinganda xabar beramiz.",
             parse_mode="Markdown"
         )
-        # Orqaga qaytish tugmasi
-        back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")]])
-        await query.message.reply_text("Boshqa ligaga oʻtish:", reply_markup=back)
+        # Yangilangan tugmalar bilan qayta koʻrsatish
+        keyboard = build_match_detail_keyboard(match_id, is_subscribed=True)
+        await query.message.reply_text("Oʻyin tahlili:", reply_markup=keyboard)
+        return
+
+    # ---------- Obunani bekor qilish ----------
+    if data.startswith("unsubscribe_"):
+        match_id = int(data.split("_")[1])
+        await unsubscribe_user(user_id, match_id)
+        await query.edit_message_text("❌ Siz bu oʻyinni kuzatishdan chiqdingiz.")
+        keyboard = build_match_detail_keyboard(match_id, is_subscribed=False)
+        await query.message.reply_text("Oʻyin tahlili:", reply_markup=keyboard)
         return
 
 # ========== NOTIFIKATSIYA SCHEDULERI ==========
@@ -338,7 +357,7 @@ async def notification_scheduler(app: Application):
                 if not notified_1h and 55 <= minutes_left <= 65:
                     await app.bot.send_message(
                         user_id,
-                        f"⏰ **1 soat qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} (Toshkent vaqti bilan {match_time+timedelta(hours=5)}?)\n\nTarkib eʼlon qilinishi kutilmoqda.",
+                        f"⏰ **1 soat qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC\n\nTarkib eʼlon qilinishi kutilmoqda.",
                         parse_mode="Markdown"
                     )
                     await update_notification_flags(user_id, match_id, one_hour=True)
@@ -355,7 +374,7 @@ async def notification_scheduler(app: Application):
                 if not notified_15m and 10 <= minutes_left <= 20:
                     await app.bot.send_message(
                         user_id,
-                        f"⏳ **15 daqiqa qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')}",
+                        f"⏳ **15 daqiqa qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC",
                         parse_mode="Markdown"
                     )
                     await update_notification_flags(user_id, match_id, fifteen_min=True)
@@ -363,7 +382,7 @@ async def notification_scheduler(app: Application):
         except Exception as e:
             logger.exception("Notification scheduler error")
 
-        await asyncio.sleep(60)  # har 60 soniyada tekshirish
+        await asyncio.sleep(60)
 
 # ========== ADMIN BUYRUQLARI ==========
 async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -459,7 +478,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER (Railway) ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (notifikatsiyalar bilan)")
+    return web.Response(text="✅ Bot ishlamoqda (Kuzatish tugmasi o'yin tanlanganda)")
 
 async def run_web_server():
     app = web.Application()
@@ -495,7 +514,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! Notifikatsiya tizimi faol.")
+    logger.info("🤖 Bot ishga tushdi! Notifikatsiya tizimi faol, kuzatish tugmasi o'yin sahifasida.")
 
     # Notifikatsiya schedulerini ishga tushirish
     asyncio.create_task(notification_scheduler(application))
