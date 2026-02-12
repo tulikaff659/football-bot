@@ -284,6 +284,14 @@ async def update_notification_flags(user_id: int, match_id: int, one_hour: bool 
         await db.execute(query, params)
         await db.commit()
 
+# ========== YANGI QO‘SHIMCHA: O‘YIN OBUNACHILARINI OLISH ==========
+async def get_subscribers_for_match(match_id: int):
+    """Berilgan match_id ga obuna bo‘lgan foydalanuvchilar ro‘yxatini qaytaradi"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id FROM subscriptions WHERE match_id = ?', (match_id,)) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
 # ========== API CALLS ==========
 async def fetch_matches_by_league(league_code: str):
     if not FOOTBALL_DATA_KEY:
@@ -542,18 +550,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🎁 Har bir taklif uchun +{REFERRAL_BONUS:,} soʻm bonus!\n"
             f"👇 Quyidagi havola orqali botga oʻting:\n{referral_link}"
         )
-        # Telegram share URL
         from urllib.parse import quote
         share_url = f"https://t.me/share/url?url={quote(referral_link)}&text={quote(share_text)}"
 
-        # Tugmalar: share + bosh menyu + pul qatori
         keyboard = [
             [InlineKeyboardButton("📤 Do'stlarga yuborish", url=share_url)],
             [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
             money_row()
         ]
         back_keyboard = InlineKeyboardMarkup(keyboard)
-
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
         return
 
@@ -821,8 +826,35 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except:
         await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
         return
+
+    # Tahlilni saqlash (yangi yoki yangilash)
     await add_analysis(match_id, analysis, user.id)
     await update.message.reply_text(f"✅ Tahlil qoʻshildi (Match ID: {match_id}).")
+
+    # ------------------- BILDIRISHNOMA QISMI -------------------
+    # Shu o‘yinga obuna bo‘lgan foydalanuvchilarni olish
+    subscribers = await get_subscribers_for_match(match_id)
+    if subscribers:
+        sent_count = 0
+        for uid in subscribers:
+            try:
+                # Adminning o‘ziga ham yuboriladi (agar obuna bo‘lsa) – bu istalgan holat
+                await context.bot.send_message(
+                    uid,
+                    f"📝 **Oʻyin tahlili yangilandi!**\n\n"
+                    f"🆔 Match ID: `{match_id}`\n"
+                    f"📊 **Yangi tahlil:**\n{analysis}\n\n"
+                    f"👇 Tahlilni ko‘rish uchun bosing:",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{match_id}")]
+                    ])
+                )
+                sent_count += 1
+            except Exception as e:
+                logger.error(f"Tahlil bildirishnomasini yuborib boʻlmadi (user {uid}): {e}")
+        await update.message.reply_text(f"📢 {sent_count} ta obunachiga bildirishnoma yuborildi.")
+    # ------------------------------------------------------------
 
 async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -926,7 +958,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul + Share)")
+    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul + Share + Bildirishnoma)")
 
 async def run_web_server():
     app = web.Application()
@@ -959,7 +991,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul + Share)")
+    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul + Share + Bildirishnoma)")
     asyncio.create_task(notification_scheduler(application))
     while True:
         await asyncio.sleep(3600)
