@@ -15,7 +15,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== FOOTBALL-DATA.ORG SOZLAMALARI ==========
-FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY")  # Emailda kelgan kalit
+FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY")
 FOOTBALL_DATA_HOST = "api.football-data.org"
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4/matches"
 
@@ -28,19 +28,20 @@ TOP_LEAGUES = {
     "FL1": {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
 }
 
-# Necha kun ichidagi o'yinlar (4 kun qilib belgilangan)
-DAYS_AHEAD = 4
+# Necha kun ichidagi o'yinlar
+DAYS_AHEAD = 7  # 7 kun ichidagi o'yinlar
 
-# ---------- INLINE TUGMALAR ----------
+# ---------- ASOSIY LIGA TUGMALARI ----------
 def get_leagues_keyboard():
+    """Ligalar ro'yxatini qaytaradi"""
     keyboard = []
     for league_code, data in TOP_LEAGUES.items():
         keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{league_code}")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- FOOTBALL-DATA.ORG ORQALI OʻYINLARNI OLISH ----------
+# ---------- O'YINLARNI API ORQALI OLISH ----------
 async def fetch_matches_by_league(league_code: str):
-    """Berilgan liga kodi bo'yicha 4 kun ichidagi o'yinlarni olish"""
+    """Berilgan liga kodi bo'yicha o'yinlarni olish"""
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY muhit oʻzgaruvchisida topilmadi!"}
     
@@ -52,24 +53,15 @@ async def fetch_matches_by_league(league_code: str):
         "competitions": league_code,
         "dateFrom": today,
         "dateTo": end_date,
-        "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"  # Barcha holatlar
+        "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"
     }
-    
-    logger.info(f"Soʻrov: Liga {league_code}, dan {today} gacha {end_date}")
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(
-                FOOTBALL_DATA_URL, 
-                headers=headers, 
-                params=params
-            ) as resp:
-                logger.info(f"HTTP javob: {resp.status}")
-                
+            async with session.get(FOOTBALL_DATA_URL, headers=headers, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     matches = data.get("matches", [])
-                    logger.info(f"Oʻyinlar soni: {len(matches)}")
                     return {"success": matches}
                 elif resp.status == 401:
                     return {"error": "❌ API kaliti notoʻgʻri. Football-Data.org dan yangi kalit oling."}
@@ -81,47 +73,31 @@ async def fetch_matches_by_league(league_code: str):
         logger.exception("Ulanish xatosi")
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
-# ---------- OʻYINLARNI FORMATLASH ----------
-def format_matches(matches, league_name):
-    if not matches:
-        return f"⚽ {league_name}\n{DAYS_AHEAD} kun ichida oʻyinlar yoʻq."
+# ---------- O'YINLAR UCHUN TUGMALAR YARATISH ----------
+def build_matches_keyboard(matches, league_code):
+    """O'yinlar ro'yxatidan inline tugmalar yaratish"""
+    keyboard = []
     
-    text = f"🏆 **{league_name}**\n"
-    text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – keyingi {DAYS_AHEAD} kun\n"
-    text += "━" * 35 + "\n"
-    
-    for match in matches:
+    for match in matches[:10]:  # Eng ko'pi 10 ta o'yin
         home = match["homeTeam"]["name"]
         away = match["awayTeam"]["name"]
         match_date = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
-        tashkent_time = match_date + timedelta(hours=5)  # UTC+5 (Toshkent)
+        tashkent_time = match_date + timedelta(hours=5)
         date_str = tashkent_time.strftime("%d.%m %H:%M")
-        status = match["status"]
         
-        # Statusga qarab ikonka va hisob
-        if status == "FINISHED":
-            status_icon = "✅"
-            score_home = match["score"]["fullTime"]["home"]
-            score_away = match["score"]["fullTime"]["away"]
-            if score_home is None or score_away is None:
-                score = f"⏳ {date_str}"
-            else:
-                score = f"**{score_home}:{score_away}**"
-        elif status in ["LIVE", "IN_PLAY", "PAUSED"]:
-            status_icon = "🟢"
-            score_home = match["score"]["fullTime"]["home"] or match["score"]["halfTime"]["home"] or 0
-            score_away = match["score"]["fullTime"]["away"] or match["score"]["halfTime"]["away"] or 0
-            score = f"{score_home}:{score_away}"
-        else:  # SCHEDULED, TIMED
-            status_icon = "⏳"
-            score = date_str
-        
-        text += f"• {home} – {away}  {score}  {status_icon}\n"
+        # O'yin nomi: "Manchester City – Liverpool (14.02 19:45)"
+        button_text = f"{home} – {away} ({date_str})"
+        callback_data = f"match_{match['id']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
     
-    return text
+    # Orqaga qaytish tugmasi
+    keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 # ---------- TELEGRAM HANDLERLAR ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start komandasi – ligalarni ko'rsatadi"""
     user = update.effective_user
     await update.message.reply_text(
         f"👋 Assalomu alaykum, {user.first_name}!\n"
@@ -130,25 +106,102 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Barcha inline tugmalar uchun asosiy handler"""
     query = update.callback_query
     await query.answer()
     
-    league_code = query.data.split("_")[1]  # "league_PL" -> "PL"
-    league_info = TOP_LEAGUES[league_code]
+    data = query.data
     
-    await query.edit_message_text(f"⏳ {league_info['name']} – oʻyinlar yuklanmoqda...")
-    result = await fetch_matches_by_league(league_code)
+    # -------------------- LIGALAR RO'YXATIGA QAYTISH --------------------
+    if data == "leagues":
+        await query.edit_message_text(
+            "Quyidagi chempionatlardan birini tanlang:",
+            reply_markup=get_leagues_keyboard()
+        )
+        return
     
-    if "error" in result:
-        text = result["error"]
-    else:
-        text = format_matches(result["success"], league_info['name'])
+    # -------------------- LIGA TANLASH --------------------
+    if data.startswith("league_"):
+        league_code = data.split("_")[1]
+        league_info = TOP_LEAGUES.get(league_code)
+        
+        if not league_info:
+            await query.edit_message_text("❌ Notoʻgʻri tanlov.")
+            return
+        
+        # Yuklanayotgan xabar
+        await query.edit_message_text(f"⏳ {league_info['name']} – oʻyinlar yuklanmoqda...")
+        
+        # API dan ma'lumot olish
+        result = await fetch_matches_by_league(league_code)
+        
+        if "error" in result:
+            await query.edit_message_text(
+                result["error"],
+                reply_markup=get_leagues_keyboard()
+            )
+            return
+        
+        matches = result["success"]
+        
+        if not matches:
+            await query.edit_message_text(
+                f"⚽ {league_info['name']}\n{DAYS_AHEAD} kun ichida oʻyinlar yoʻq.",
+                reply_markup=get_leagues_keyboard()
+            )
+            return
+        
+        # O'yinlar ro'yxatini tugmalar shaklida ko'rsatish
+        keyboard = build_matches_keyboard(matches, league_code)
+        await query.edit_message_text(
+            f"🏆 **{league_info['name']}** – {DAYS_AHEAD} kun ichidagi oʻyinlar:\n\n"
+            "Quyidagi oʻyinlardan birini tanlang:",
+            parse_mode="Markdown",
+            reply_markup=keyboard
+        )
     
-    await query.edit_message_text(
-        text,
-        parse_mode="Markdown",
-        reply_markup=get_leagues_keyboard()
-    )
+    # -------------------- O'YIN TANLASH --------------------
+    elif data.startswith("match_"):
+        match_id = data.split("_")[1]
+        
+        # Hozircha oddiy xabar – keyinroq tahlil qo'shiladi
+        await query.edit_message_text(
+            f"⚽ **O'yin tahlili**\n\n"
+            f"🆔 Match ID: `{match_id}`\n"
+            f"📊 Ma'lumot yig'ilmoqda...\n\n"
+            f"⏳ Ekspertlar tahlili, kutilayotgan tarkib va bashoratlar tez orada qoʻshiladi.",
+            parse_mode="Markdown"
+        )
+        
+        # ORQAGA QAYTISH UCHUN – bu xabardan keyin foydalanuvchi orqaga qaytishi kerak
+        # Qulaylik uchun "🔙 Back to Leagues" tugmasini qo'shamiz
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")]
+        ])
+        await query.message.reply_text(
+            "Boshqa ligaga oʻtish:",
+            reply_markup=keyboard
+        )
+
+# ---------- YORDAMCHI BUYRUQLAR (TEST, DEBUG) ----------
+async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """API kaliti va ulanishni tekshiradi"""
+    if not FOOTBALL_DATA_KEY:
+        await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
+        return
+    
+    url = "https://api.football-data.org/v4/competitions/PL/matches?dateFrom=2026-02-01&dateTo=2026-02-28"
+    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    await update.message.reply_text("✅ **API ulanishi muvaffaqiyatli!**")
+                else:
+                    await update.message.reply_text(f"❌ API xatolik: {resp.status}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Ulanish xatosi: {type(e).__name__}")
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """API javobini toʻliq koʻrsatadi (Premyer Liga misolida)"""
@@ -183,34 +236,16 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await msg.edit_text(f"❌ Xatolik: {type(e).__name__}")
 
-async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """API kaliti va ulanishni tekshiradi"""
-    if not FOOTBALL_DATA_KEY:
-        await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
-        return
-    
-    url = "https://api.football-data.org/v4/competitions/PL/matches?dateFrom=2026-02-01&dateTo=2026-02-28"
-    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
-    
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    await update.message.reply_text("✅ **API ulanishi muvaffaqiyatli!**")
-                else:
-                    await update.message.reply_text(f"❌ API xatolik: {resp.status}")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Ulanish xatosi: {type(e).__name__}")
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Har qanday matnli xabarga javob"""
     await update.message.reply_text(
-        f"Quyidagi chempionatlardan birini tanlang – {DAYS_AHEAD} kun ichidagi oʻyinlar:",
+        "Quyidagi chempionatlardan birini tanlang:",
         reply_markup=get_leagues_keyboard()
     )
 
 # ---------- WEB SERVER (Railway uchun) ----------
 async def health_check(request):
-    return web.Response(text="✅ Football-Data.org bot ishlamoqda")
+    return web.Response(text="✅ Football-Data.org bot ishlamoqda (2 bosqichli tanlov)")
 
 async def run_web_server():
     app = web.Application()
@@ -239,7 +274,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Football-Data.org, 4 kunlik oʻyinlar)")
+    logger.info("🤖 Bot ishga tushdi! (Football-Data.org, 7 kunlik oʻyinlar, tahlil uchun tayyor)")
     
     while True:
         await asyncio.sleep(3600)
