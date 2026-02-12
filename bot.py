@@ -5,7 +5,6 @@ import aiohttp
 import aiosqlite
 import random
 import time
-import re
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from urllib.parse import quote
@@ -93,7 +92,7 @@ async def init_db():
         await db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         await db.execute("""CREATE TABLE IF NOT EXISTS match_analyses (
             match_id INTEGER PRIMARY KEY, 
-            analysis TEXT NOT NULL, 
+            analysis TEXT NOT NULL DEFAULT 'Tahlil kutilmoqda', 
             analysis_url TEXT,
             added_by INTEGER NOT NULL, 
             added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
@@ -244,19 +243,45 @@ async def get_all_admins():
         async with db.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at") as cur:
             return await cur.fetchall()
 
-# ========== ANALYSIS ==========
-async def add_analysis(match_id: int, analysis: str, url: str, added_by: int):
+# ========== ANALYSIS (AYRILGAN FUNKSIYALAR) ==========
+async def update_analysis_text(match_id: int, analysis: str, added_by: int):
+    """Faqat tahlil matnini yangilaydi, URL ga tegmaydi."""
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""INSERT INTO match_analyses (match_id, analysis, analysis_url, added_by) VALUES (?, ?, ?, ?)
-            ON CONFLICT(match_id) DO UPDATE SET 
-            analysis = excluded.analysis, 
-            analysis_url = excluded.analysis_url,
-            added_by = excluded.added_by, 
-            added_at = CURRENT_TIMESTAMP""",
-            (match_id, analysis, url, added_by))
+        await db.execute("""
+            INSERT INTO match_analyses (match_id, analysis, added_by)
+            VALUES (?, ?, ?)
+            ON CONFLICT(match_id) DO UPDATE SET
+                analysis = excluded.analysis,
+                added_by = excluded.added_by,
+                added_at = CURRENT_TIMESTAMP
+        """, (match_id, analysis, added_by))
+        await db.commit()
+
+async def update_analysis_url(match_id: int, url: str, added_by: int):
+    """Faqat URL ni yangilaydi, tahlil matniga tegmaydi.
+       Agar match_id mavjud bo'lmasa, placeholder tahlil matni bilan qator yaratadi.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Mavjudligini tekshiramiz
+        async with db.execute("SELECT analysis FROM match_analyses WHERE match_id = ?", (match_id,)) as cur:
+            row = await cur.fetchone()
+        if row:
+            # Mavjud – faqat URL ni yangilaymiz
+            await db.execute("""
+                UPDATE match_analyses 
+                SET analysis_url = ?, added_by = ?, added_at = CURRENT_TIMESTAMP
+                WHERE match_id = ?
+            """, (url, added_by, match_id))
+        else:
+            # Mavjud emas – yangi qator yaratamiz
+            await db.execute("""
+                INSERT INTO match_analyses (match_id, analysis, analysis_url, added_by)
+                VALUES (?, ?, ?, ?)
+            """, (match_id, "📝 Tahlil kutilmoqda", url, added_by))
         await db.commit()
 
 async def get_analysis(match_id: int):
+    """Tahlil matni, URL va qo'shilgan sanani qaytaradi."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT analysis, analysis_url, added_at FROM match_analyses WHERE match_id = ?", (match_id,)) as cur:
             return await cur.fetchone()
@@ -643,7 +668,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer("❌ Kuzatish bekor qilindi", show_alert=False)
         return
 
-# ========== NOTIFICATION SCHEDULER (OPTIMIZED) ==========
+# ========== NOTIFICATION SCHEDULER ==========
 async def notification_scheduler(app: Application):
     while True:
         try:
@@ -714,18 +739,18 @@ async def notification_scheduler(app: Application):
             logger.exception(f"Scheduler xatosi: {e}")
         await asyncio.sleep(60)
 
-# ========== ADMIN COMMANDS ==========
+# ========== ADMIN BUYRUQLARI (YANGI VERSIYA) ==========
 async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Faqat tahlil matnini qo'shadi/yangilaydi. URL qabul qilmaydi."""
     u = update.effective_user
     if not await is_admin(u.id):
         await update.message.reply_text("❌ Siz admin emassiz.")
         return
-    
+
     if len(context.args) < 2:
         await update.message.reply_text(
-            "❌ Ishlatish:\n`/addanalysis <match_id> <tahlil matni> [ixtiyoriy URL]`\n\n"
-            "URL `http://` yoki `https://` bilan boshlanishi kerak va istalgan joyda yozilishi mumkin.\n"
-            "Misol: `/addanalysis 123456 Arsenal favorit! https://t.me/ai_futinside/29`",
+            "❌ Ishlatish: `/addanalysis <match_id> <tahlil matni>`\n"
+            "Misol: `/addanalysis 123456 Arsenal favorit!`",
             parse_mode="Markdown"
         )
         return
@@ -736,50 +761,26 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
         return
 
-    # URL ni barcha argumentlar ichidan qidirish
-    url_pattern = r'https?://[^\s]+'
-    args_list = context.args[1:]
-    url = None
-    text_parts = []
-    
-    for arg in args_list:
-        if re.match(url_pattern, arg):
-            url = arg
-        else:
-            text_parts.append(arg)
-    
-    text = ' '.join(text_parts)
-    
+    text = ' '.join(context.args[1:])
     if not text:
         await update.message.reply_text("❌ Tahlil matni boʻsh boʻlishi mumkin emas.")
         return
 
-    # Bazaga yozish
-    await add_analysis(match_id, text, url, u.id)
-    
-    reply_msg = f"✅ Tahlil qoʻshildi (Match ID: {match_id})."
-    if url:
-        reply_msg += f"\n🔗 Havola: {url}"
-    await update.message.reply_text(reply_msg, parse_mode="Markdown")
-    
+    await update_analysis_text(match_id, text, u.id)
+    await update.message.reply_text(f"✅ Tahlil matni qoʻshildi (Match ID: {match_id}).")
+
     # Obunachilarga xabar yuborish
     subs = await get_subscribers_for_match(match_id)
     if subs:
         sent = 0
         safe_text = escape_markdown(text, version=2)
-        # Tugmalar
         buttons = [[InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{match_id}")]]
-        if url:
-            buttons.append([InlineKeyboardButton("🔗 To‘liq tahlil", url=url)])
         keyboard = InlineKeyboardMarkup(buttons)
-        
         for sid in subs:
             try:
                 await context.bot.send_message(
                     sid,
-                    f"📝 **Oʻyin tahlili yangilandi!**\n\n"
-                    f"🆔 Match ID: `{match_id}`\n"
-                    f"📊 **Yangi tahlil:**\n{safe_text}",
+                    f"📝 **Oʻyin tahlili yangilandi!**\n\n🆔 Match ID: `{match_id}`\n📊 **Yangi tahlil:**\n{safe_text}",
                     parse_mode="Markdown",
                     reply_markup=keyboard
                 )
@@ -788,6 +789,63 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 logger.error(f"Tahlil bildirishnomasi xatosi (user {sid}): {e}")
         await update.message.reply_text(f"📢 {sent} ta obunachiga bildirishnoma yuborildi.")
 
+async def add_url_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Faqat to'liq tahlil URL ini qo'shadi/yangilaydi. Matnni o'zgartirmaydi."""
+    u = update.effective_user
+    if not await is_admin(u.id):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "❌ Ishlatish: `/addurl <match_id> <havola>`\n"
+            "Misol: `/addurl 123456 https://t.me/ai_futinside/29`",
+            parse_mode="Markdown"
+        )
+        return
+
+    try:
+        match_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
+        return
+
+    url = context.args[1].strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.message.reply_text("❌ Havola `http://` yoki `https://` bilan boshlanishi kerak.", parse_mode="Markdown")
+        return
+
+    await update_analysis_url(match_id, url, u.id)
+    await update.message.reply_text(f"✅ Toʻliq tahlil havolasi qoʻshildi (Match ID: {match_id}).\n🔗 {url}")
+
+    # Obunachilarga xabar yuborish
+    subs = await get_subscribers_for_match(match_id)
+    if subs:
+        sent = 0
+        analysis_row = await get_analysis(match_id)
+        analysis_text = analysis_row[0] if analysis_row else "Tahlil kutilmoqda"
+        safe_text = escape_markdown(analysis_text, version=2)
+        buttons = [
+            [InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{match_id}")],
+            [InlineKeyboardButton("🔗 To‘liq tahlil", url=url)]
+        ]
+        keyboard = InlineKeyboardMarkup(buttons)
+        for sid in subs:
+            try:
+                await context.bot.send_message(
+                    sid,
+                    f"🔗 **Oʻyin uchun toʻliq tahlil havolasi qoʻshildi!**\n\n"
+                    f"🆔 Match ID: `{match_id}`\n"
+                    f"📊 **Tahlil:**\n{safe_text}",
+                    parse_mode="Markdown",
+                    reply_markup=keyboard
+                )
+                sent += 1
+            except Exception as e:
+                logger.error(f"URL bildirishnomasi xatosi (user {sid}): {e}")
+        await update.message.reply_text(f"📢 {sent} ta obunachiga bildirishnoma yuborildi.")
+
+# ========== BOSHQA ADMIN BUYRUQLARI ==========
 async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
@@ -853,7 +911,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Full version + URL button fixed)")
+    return web.Response(text="✅ Bot ishlamoqda (AddAnalysis + AddUrl separate)")
 
 async def run_web_server():
     app = web.Application()
@@ -879,13 +937,14 @@ async def run_bot():
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CommandHandler("addanalysis", add_analysis_command))
+    app.add_handler(CommandHandler("addurl", add_url_command))
     app.add_handler(CommandHandler("addadmin", add_admin_command))
     app.add_handler(CommandHandler("removeadmin", remove_admin_command))
     app.add_handler(CommandHandler("listadmins", list_admins_command))
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Full version + URL button fixed)")
+    logger.info("🤖 Bot ishga tushdi! (AddAnalysis + AddUrl separate)")
     asyncio.create_task(notification_scheduler(app))
     while True:
         await asyncio.sleep(3600)
