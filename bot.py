@@ -15,13 +15,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # MUHIT OʻZGARUVCHISIDAN OLINADI (Railway Variables)
-API_KEY = os.environ.get("API_FOOTBALL_KEY")   # Sizning kalitingiz shu yerga yoziladi
-API_HOST = "v3.football.api-sports.io"         # Dashboard API host
+API_KEY = os.environ.get("API_FOOTBALL_KEY")
+API_HOST = "v3.football.api-sports.io"
 
 # Top 5 chempionat (ID, nom)
 TOP_LEAGUES = {
     39: {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
-    140: {"name": "🇪🇸 La Liga", "country": "Ispanija"},
+    140: {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
     135: {"name": "🇮🇹 Seriya A", "country": "Italiya"},
     78: {"name": "🇩🇪 Bundesliga", "country": "Germaniya"},
     61: {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
@@ -39,25 +39,23 @@ def get_leagues_keyboard():
         keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{lid}")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- API ORQALI OʻYINLARNI OLISH ----------
+# ---------- 4 KUN ICHIDAGI OʻYINLARNI OLISH ----------
 async def fetch_matches_by_league(league_id: int):
-    """API-FOOTBALL Dashboard orqali 24 soatlik o'yinlar"""
+    """API-FOOTBALL Dashboard orqali bugun + 4 kun ichidagi o'yinlar"""
     if not API_KEY:
         return {"error": "❌ API_FOOTBALL_KEY muhit oʻzgaruvchisida topilmadi!"}
     
     today = datetime.now().strftime("%Y-%m-%d")
-    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    four_days_later = (datetime.now() + timedelta(days=4)).strftime("%Y-%m-%d")
     season = get_current_season()
     
     url = f"https://{API_HOST}/v3/fixtures"
-    headers = {
-        "x-apisports-key": API_KEY
-    }
+    headers = {"x-apisports-key": API_KEY}
     params = {
         "league": league_id,
         "season": season,
         "from": today,
-        "to": tomorrow,
+        "to": four_days_later,          # ⚽ 4 kun ichidagi o'yinlar
         "timezone": "Asia/Tashkent"
     }
     
@@ -80,10 +78,10 @@ async def fetch_matches_by_league(league_id: int):
 # ---------- OʻYINLARNI FORMATLASH ----------
 def format_matches(matches, league_name):
     if not matches:
-        return f"⚽ {league_name}\n24 soat ichida oʻyinlar yoʻq."
+        return f"⚽ {league_name}\n4 kun ichida oʻyinlar yoʻq."
     
     text = f"🏆 **{league_name}**\n"
-    text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – ertaga\n"
+    text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – keyingi 4 kun\n"
     text += "━" * 35 + "\n"
     
     for match in matches[:10]:
@@ -91,20 +89,28 @@ def format_matches(matches, league_name):
         teams = match["teams"]
         goals = match["goals"]
         status = fixture["status"]["short"]
-        match_time = fixture["date"][11:16]
+        match_date = fixture["date"][:10]  # Sana
+        match_time = fixture["date"][11:16]  # Vaqt
+        
+        # Sana va vaqtni ko'rsatish
+        date_obj = datetime.strptime(match_date, "%Y-%m-%d")
+        date_str = date_obj.strftime("%d.%m")
         
         if status == "LIVE":
             status_icon = "🟢"
             score = f"{goals['home']}:{goals['away']}"
+            time_str = ""
         elif status == "HT":
             status_icon = "🟡"
             score = f"{goals['home']}:{goals['away']}"
+            time_str = ""
         elif status == "FT":
             status_icon = "✅"
             score = f"**{goals['home']}:{goals['away']}**"
+            time_str = ""
         else:
             status_icon = "⏳"
-            score = match_time
+            score = f"{date_str} {match_time}"
         
         text += f"• {teams['home']['name']} – {teams['away']['name']}  {score}  {status_icon}\n"
     
@@ -115,7 +121,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"👋 Assalomu alaykum, {user.first_name}!\n"
-        "Quyidagi chempionatlardan birini tanlang:",
+        "Quyidagi chempionatlardan birini tanlang – 4 kun ichidagi oʻyinlar:",
         reply_markup=get_leagues_keyboard()
     )
 
@@ -141,7 +147,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """API statusini tekshirish"""
     if not API_KEY:
         await update.message.reply_text("❌ API_FOOTBALL_KEY muhit oʻzgaruvchisida topilmadi!")
         return
@@ -166,13 +171,13 @@ async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Quyidagi chempionatlardan birini tanlang:",
+        "Quyidagi chempionatlardan birini tanlang – 4 kun ichidagi oʻyinlar:",
         reply_markup=get_leagues_keyboard()
     )
 
 # ---------- WEB SERVER (Railway uchun) ----------
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (API-FOOTBALL Dashboard)")
+    return web.Response(text="✅ Bot ishlamoqda (4 kunlik o'yinlar)")
 
 async def run_web_server():
     app = web.Application()
@@ -200,7 +205,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! API-FOOTBALL Dashboard ulandi")
+    logger.info("🤖 Bot ishga tushdi! API-FOOTBALL Dashboard (4 kunlik o'yinlar)")
     
     while True:
         await asyncio.sleep(3600)
