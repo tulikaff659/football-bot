@@ -9,6 +9,8 @@ from aiohttp import web
 from urllib.parse import quote
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from collections import OrderedDict
+import time
 
 # ---------- SOZLAMALAR ----------
 logging.basicConfig(
@@ -22,6 +24,7 @@ FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY")
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_KEY}
 
+# Top 5 chempionat
 TOP_LEAGUES = {
     "PL": {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
     "PD": {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
@@ -63,11 +66,71 @@ MIN_WITHDRAW = 50000
 MAX_WITHDRAW_DAILY = 1
 AISPORTS_BONUS = 30000
 
+# ========== API RATE LIMIT ==========
+API_SEMAPHORE = asyncio.Semaphore(1)  # Bir vaqtda faqat 1 ta API call
+API_LAST_CALL = 0
+API_MIN_INTERVAL = 6  # 10 request/min -> har 6 sekundda 1 ta
+
+async def rate_limited_api_call(url, headers, params=None):
+    """429 xatolarni avtomatik hal qiluvchi rate-limited API caller"""
+    global API_LAST_CALL
+    async with API_SEMAPHORE:
+        # So'nggi so'rovdan beri 6 sekund o'tganligini tekshirish
+        now = time.time()
+        if now - API_LAST_CALL < API_MIN_INTERVAL:
+            await asyncio.sleep(API_MIN_INTERVAL - (now - API_LAST_CALL))
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers, params=params) as resp:
+                        API_LAST_CALL = time.time()
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return {"success": data}
+                        elif resp.status == 429:
+                            wait_time = 2 ** attempt + random.uniform(1, 3)
+                            logger.warning(f"429 xatosi, {wait_time:.1f} sekund kutish...")
+                            await asyncio.sleep(wait_time)
+                            continue
+                        else:
+                            return {"error": f"❌ API xatolik: {resp.status}"}
+            except Exception as e:
+                logger.exception(f"Ulanish xatosi (urinsh {attempt+1}): {e}")
+                if attempt == max_retries - 1:
+                    return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
+                await asyncio.sleep(2 ** attempt)
+        return {"error": "❌ API ga bogʻlanib boʻlmadi"}
+
+# ========== MATCH CACHE (10 daqiqa) ==========
+match_cache = OrderedDict()
+CACHE_TTL = 600  # 10 daqiqa
+
+async def get_cached_match(match_id: int):
+    """Match ma'lumotini keshdan olish, yo'q bo'lsa API dan so'rash"""
+    now = time.time()
+    if match_id in match_cache:
+        data, timestamp = match_cache[match_id]
+        if now - timestamp < CACHE_TTL:
+            return data
+        else:
+            del match_cache[match_id]
+    
+    # API dan olish
+    url = f"{FOOTBALL_DATA_URL}/matches/{match_id}"
+    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
+    result = await rate_limited_api_call(url, headers)
+    
+    if "success" in result:
+        match_cache[match_id] = (result["success"], now)
+        return result["success"]
+    return None
+
 # ========== DATABASE ==========
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-        # Adminlar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -75,7 +138,6 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Tahlillar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS match_analyses (
                 match_id INTEGER PRIMARY KEY,
@@ -84,7 +146,6 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Obunalar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
                 user_id INTEGER,
@@ -100,7 +161,6 @@ async def init_db():
                 PRIMARY KEY (user_id, match_id)
             )
         ''')
-        # Foydalanuvchilar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -113,13 +173,10 @@ async def init_db():
                 FOREIGN KEY (referrer_id) REFERENCES users(user_id)
             )
         ''')
-        # Eski bazaga `aisports_bonus_received` ustunini qo'shish
         try:
             await db.execute('ALTER TABLE users ADD COLUMN aisports_bonus_received INTEGER DEFAULT 0')
         except:
             pass
-        
-        # Referallar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS referrals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -130,7 +187,6 @@ async def init_db():
                 UNIQUE(referred_id)
             )
         ''')
-        # Yechimlar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,7 +198,6 @@ async def init_db():
         ''')
         await db.commit()
     
-    # Asosiy admin
     MAIN_ADMIN = 6935090105
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
@@ -153,7 +208,6 @@ async def init_db():
 
 # ========== USER FUNCTIONS ==========
 async def send_referral_notification(referrer_id: int, referred_name: str, bonus: int, bot):
-    """Taklif qilgan foydalanuvchiga bonus haqida xabar yuboradi"""
     try:
         await bot.send_message(
             referrer_id,
@@ -174,7 +228,6 @@ async def get_or_create_user(user_id: int, referrer_id: int = None, bot=None, re
         if not user:
             await db.execute('INSERT INTO users (user_id, referrer_id, aisports_bonus_received) VALUES (?, ?, 0)', (user_id, referrer_id))
             await db.commit()
-            # Referal bonus
             if referrer_id and referrer_id != user_id:
                 async with db.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,)) as cursor:
                     if await cursor.fetchone():
@@ -182,7 +235,6 @@ async def get_or_create_user(user_id: int, referrer_id: int = None, bot=None, re
                         await db.execute('INSERT OR IGNORE INTO referrals (referrer_id, referred_id, bonus) VALUES (?, ?, ?)', (referrer_id, user_id, REFERRAL_BONUS))
                         await db.commit()
                         logger.info(f"Referal bonus: {referrer_id} +{REFERRAL_BONUS} (yangi {user_id})")
-                        # 📢 Bildirishnoma yuborish
                         if bot and referred_user_name:
                             asyncio.create_task(send_referral_notification(referrer_id, referred_user_name, REFERRAL_BONUS, bot))
             async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
@@ -238,7 +290,6 @@ async def get_referral_stats(user_id: int):
 
 # ========== AISPORTS BONUS ==========
 async def give_aisports_bonus(user_id: int, bot):
-    """1-2 daqiqadan so'ng foydalanuvchiga 30 000 so'm bonus beradi (bir marta)."""
     delay = random.randint(60, 120)
     await asyncio.sleep(delay)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -261,7 +312,6 @@ async def give_aisports_bonus(user_id: int, bot):
         logger.error(f"Aisports bonus xabari yuborilmadi ({user_id}): {e}")
 
 async def schedule_aisports_bonus(user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Foydalanuvchi bonus olmagan bo'lsa, 1-2 daqiqadan so'ng berishni rejalashtiradi."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT aisports_bonus_received FROM users WHERE user_id = ?', (user_id,)) as cursor:
             row = await cursor.fetchone()
@@ -359,51 +409,31 @@ async def get_subscribers_for_match(match_id: int):
             rows = await cursor.fetchall()
             return [row[0] for row in rows]
 
-# ========== API CALLS ==========
+# ========== MATCH DATA FUNCTIONS ==========
 async def fetch_matches_by_league(league_code: str):
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
     today = datetime.now().strftime("%Y-%m-%d")
     end_date = (datetime.now() + timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
+    url = f"{FOOTBALL_DATA_URL}/matches"
+    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
     params = {
         "competitions": league_code,
         "dateFrom": today,
         "dateTo": end_date,
         "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{FOOTBALL_DATA_URL}/matches", headers=HEADERS, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return {"success": data.get("matches", [])}
-                else:
-                    return {"error": f"❌ API xatolik: {resp.status}"}
-    except Exception as e:
-        logger.exception("Ulanish xatosi")
-        return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
+    result = await rate_limited_api_call(url, headers, params)
+    if "success" in result:
+        return {"success": result["success"].get("matches", [])}
+    else:
+        return result
 
-async def fetch_match_by_id(match_id: int):
-    if not FOOTBALL_DATA_KEY:
-        return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{FOOTBALL_DATA_URL}/matches/{match_id}", headers=HEADERS) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return {"success": data}
-                else:
-                    return {"error": f"❌ API xatolik: {resp.status}"}
-    except Exception as e:
-        logger.exception("Ulanish xatosi")
-        return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
-
-# ========== LINEUPS ==========
 async def fetch_match_lineups(match_id: int):
-    result = await fetch_match_by_id(match_id)
-    if "error" in result:
+    """Match tarkiblarini olish (1 ta API call, cached)"""
+    match = await get_cached_match(match_id)
+    if not match:
         return None
-    match = result["success"]
     home_lineup = match.get("homeTeam", {}).get("lineup", [])
     away_lineup = match.get("awayTeam", {}).get("lineup", [])
     return {
@@ -743,17 +773,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("match_"):
         match_id = int(data.split("_")[1])
         analysis = await get_analysis(match_id)
-        match_result = await fetch_match_by_id(match_id)
+        
+        # Keshdan olish
+        match = await get_cached_match(match_id)
         league_code = "PL"
         home_team = "Noma'lum"
         away_team = "Noma'lum"
-        if "success" in match_result:
-            match_data = match_result["success"]
-            competition = match_data.get("competition", {}).get("code", "")
+        if match:
+            competition = match.get("competition", {}).get("code", "")
             if competition in TOP_LEAGUES:
                 league_code = competition
-            home_team = match_data.get("homeTeam", {}).get("name", "Noma'lum")
-            away_team = match_data.get("awayTeam", {}).get("name", "Noma'lum")
+            home_team = match.get("homeTeam", {}).get("name", "Noma'lum")
+            away_team = match.get("awayTeam", {}).get("name", "Noma'lum")
+        
         if analysis:
             text, added_at = analysis
             added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
@@ -763,11 +795,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{match_id}`\n📊 Hozircha tahlil mavjud emas."
             if await is_admin(user_id):
                 msg += f"\n\n💡 Admin: `/addanalysis {match_id} <tahlil>`"
+        
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute('SELECT 1 FROM subscriptions WHERE user_id = ? AND match_id = ?', (user_id, match_id)) as cursor:
                 is_subscribed = await cursor.fetchone() is not None
+        
         lineups_data = await fetch_match_lineups(match_id)
         lineups_available = lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup'])
+        
         keyboard = build_match_detail_keyboard(match_id, is_subscribed, lineups_available)
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
@@ -780,17 +815,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg = format_lineups_message(lineups_data)
         else:
             msg = "❌ Bu oʻyin uchun tarkiblar hali eʼlon qilinmagan."
-        match_result = await fetch_match_by_id(match_id)
+        
+        match = await get_cached_match(match_id)
         league_code = "PL"
         home_team = "Noma'lum"
         away_team = "Noma'lum"
-        if "success" in match_result:
-            match_data = match_result["success"]
-            competition = match_data.get("competition", {}).get("code", "")
+        if match:
+            competition = match.get("competition", {}).get("code", "")
             if competition in TOP_LEAGUES:
                 league_code = competition
-            home_team = match_data.get("homeTeam", {}).get("name", "Noma'lum")
-            away_team = match_data.get("awayTeam", {}).get("name", "Noma'lum")
+            home_team = match.get("homeTeam", {}).get("name", "Noma'lum")
+            away_team = match.get("awayTeam", {}).get("name", "Noma'lum")
+        
         links = generate_match_links(match_id, home_team, away_team, league_code)
         msg += "\n\n" + format_links_message(links)
         keyboard = InlineKeyboardMarkup([
@@ -803,11 +839,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("subscribe_"):
         match_id = int(data.split("_")[1])
-        result = await fetch_match_by_id(match_id)
-        if "error" in result:
-            await query.answer("❌ Xatolik yuz berdi", show_alert=True)
+        match = await get_cached_match(match_id)
+        if not match:
+            await query.answer("❌ Match ma'lumotlarini olishda xatolik", show_alert=True)
             return
-        match = result["success"]
         home = match["homeTeam"]["name"]
         away = match["awayTeam"]["name"]
         match_time = match["utcDate"]
@@ -827,51 +862,115 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Kuzatish bekor qilindi", show_alert=False)
         return
 
-# ========== NOTIFICATION SCHEDULER ==========
+# ========== NOTIFICATION SCHEDULER (OPTIMIZED) ==========
 async def notification_scheduler(app: Application):
+    """Har daqiqa ishlaydi, optimallashtirilgan - match bo'yicha guruhlangan"""
     while True:
         try:
             now = datetime.utcnow()
             subscriptions = await get_all_subscriptions()
+            
+            # Match ID bo'yicha guruhlash
+            match_subscribers = {}
             for sub in subscriptions:
                 user_id, match_id, match_time_str, home, away, league_code, notified_1h, notified_15m, notified_lineups = sub
-                match_time = datetime.strptime(match_time_str, "%Y-%m-%dT%H:%M:%SZ")
-                delta = match_time - now
+                if match_id not in match_subscribers:
+                    match_subscribers[match_id] = {
+                        "match_time": datetime.strptime(match_time_str, "%Y-%m-%dT%H:%M:%SZ"),
+                        "home": home,
+                        "away": away,
+                        "league_code": league_code,
+                        "subscribers": [],
+                        "notified_1h_already": False,
+                        "notified_15m_already": False,
+                        "notified_lineups_already": False
+                    }
+                match_subscribers[match_id]["subscribers"].append({
+                    "user_id": user_id,
+                    "notified_1h": notified_1h,
+                    "notified_15m": notified_15m,
+                    "notified_lineups": notified_lineups
+                })
+            
+            # Har bir match uchun bir marta API call
+            for match_id, data in match_subscribers.items():
+                delta = data["match_time"] - now
                 minutes_left = delta.total_seconds() / 60
-                if not notified_1h and 55 <= minutes_left <= 65:
-                    await app.bot.send_message(
-                        user_id,
-                        f"⏰ **1 soat qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC+0\n\n📋 Tarkiblar eʼlon qilinishi kutilmoqda.",
-                        parse_mode="Markdown"
-                    )
-                    if not notified_lineups:
-                        lineups_data = await fetch_match_lineups(match_id)
-                        if lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup']):
-                            lineup_msg = format_lineups_message(lineups_data)
-                            await app.bot.send_message(user_id, lineup_msg, parse_mode="Markdown")
-                            links = generate_match_links(match_id, home, away, league_code)
-                            links_msg = format_links_message(links)
-                            await app.bot.send_message(user_id, links_msg, parse_mode="Markdown", disable_web_page_preview=True)
-                        else:
-                            links = generate_match_links(match_id, home, away, league_code)
-                            msg = f"📋 **{home} – {away}**\n\n"
-                            msg += "❌ Tarkiblar API orqali e'lon qilinmagan.\n"
-                            msg += "🔗 Quyidagi ishonchli saytlarda tarkiblarni ko‘ring:\n\n"
-                            for name, url in links[:4]:
-                                msg += f"• [{name}]({url})\n"
-                            await app.bot.send_message(user_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
-                        await update_notification_flags(user_id, match_id, lineups=True)
-                    await update_notification_flags(user_id, match_id, one_hour=True)
-                if not notified_15m and 10 <= minutes_left <= 20:
-                    links = generate_match_links(match_id, home, away, league_code)
-                    msg = f"⏳ **15 daqiqa qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC+0\n\n"
-                    msg += "🔗 Jonli tarkiblar va statistika:\n\n"
-                    for name, url in links[:5]:
-                        msg += f"• [{name}]({url})\n"
-                    await app.bot.send_message(user_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
-                    await update_notification_flags(user_id, match_id, fifteen_min=True)
+                
+                # 1 soat qolganda
+                if not data["notified_1h_already"] and any(not s["notified_1h"] for s in data["subscribers"]):
+                    if 55 <= minutes_left <= 65:
+                        # 1 soat xabarini barcha obunachilarga yuborish
+                        for subscriber in data["subscribers"]:
+                            if not subscriber["notified_1h"]:
+                                try:
+                                    await app.bot.send_message(
+                                        subscriber["user_id"],
+                                        f"⏰ **1 soat qoldi!**\n\n{data['home']} – {data['away']}\n🕒 {data['match_time'].strftime('%d.%m.%Y %H:%M')} UTC+0\n\n📋 Tarkiblar eʼlon qilinishi kutilmoqda.",
+                                        parse_mode="Markdown"
+                                    )
+                                    await update_notification_flags(subscriber["user_id"], match_id, one_hour=True)
+                                except Exception as e:
+                                    logger.error(f"1h notification error for user {subscriber['user_id']}: {e}")
+                        
+                        # Lineups - faqat bir marta olinadi va barchaga yuboriladi
+                        if not data["notified_lineups_already"] and any(not s["notified_lineups"] for s in data["subscribers"]):
+                            lineups_data = await fetch_match_lineups(match_id)
+                            if lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup']):
+                                lineup_msg = format_lineups_message(lineups_data)
+                                links = generate_match_links(match_id, data['home'], data['away'], data['league_code'])
+                                links_msg = format_links_message(links)
+                                
+                                for subscriber in data["subscribers"]:
+                                    if not subscriber["notified_lineups"]:
+                                        try:
+                                            await app.bot.send_message(subscriber["user_id"], lineup_msg, parse_mode="Markdown")
+                                            await app.bot.send_message(subscriber["user_id"], links_msg, parse_mode="Markdown", disable_web_page_preview=True)
+                                            await update_notification_flags(subscriber["user_id"], match_id, lineups=True)
+                                        except Exception as e:
+                                            logger.error(f"Lineups notification error for user {subscriber['user_id']}: {e}")
+                            else:
+                                links = generate_match_links(match_id, data['home'], data['away'], data['league_code'])
+                                msg = f"📋 **{data['home']} – {data['away']}**\n\n"
+                                msg += "❌ Tarkiblar API orqali e'lon qilinmagan.\n"
+                                msg += "🔗 Quyidagi ishonchli saytlarda tarkiblarni ko‘ring:\n\n"
+                                for name, url in links[:4]:
+                                    msg += f"• [{name}]({url})\n"
+                                
+                                for subscriber in data["subscribers"]:
+                                    if not subscriber["notified_lineups"]:
+                                        try:
+                                            await app.bot.send_message(subscriber["user_id"], msg, parse_mode="Markdown", disable_web_page_preview=True)
+                                            await update_notification_flags(subscriber["user_id"], match_id, lineups=True)
+                                        except Exception as e:
+                                            logger.error(f"Lineups notification error for user {subscriber['user_id']}: {e}")
+                            
+                            data["notified_lineups_already"] = True
+                        
+                        data["notified_1h_already"] = True
+                
+                # 15 daqiqa qolganda
+                if not data["notified_15m_already"] and any(not s["notified_15m"] for s in data["subscribers"]):
+                    if 10 <= minutes_left <= 20:
+                        links = generate_match_links(match_id, data['home'], data['away'], data['league_code'])
+                        msg = f"⏳ **15 daqiqa qoldi!**\n\n{data['home']} – {data['away']}\n🕒 {data['match_time'].strftime('%d.%m.%Y %H:%M')} UTC+0\n\n"
+                        msg += "🔗 Jonli tarkiblar va statistika:\n\n"
+                        for name, url in links[:5]:
+                            msg += f"• [{name}]({url})\n"
+                        
+                        for subscriber in data["subscribers"]:
+                            if not subscriber["notified_15m"]:
+                                try:
+                                    await app.bot.send_message(subscriber["user_id"], msg, parse_mode="Markdown", disable_web_page_preview=True)
+                                    await update_notification_flags(subscriber["user_id"], match_id, fifteen_min=True)
+                                except Exception as e:
+                                    logger.error(f"15m notification error for user {subscriber['user_id']}: {e}")
+                        
+                        data["notified_15m_already"] = True
+        
         except Exception as e:
             logger.exception(f"Notification scheduler error: {e}")
+        
         await asyncio.sleep(60)
 
 # ========== ADMIN COMMANDS ==========
@@ -889,8 +988,11 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except:
         await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
         return
+
     await add_analysis(match_id, analysis, user.id)
     await update.message.reply_text(f"✅ Tahlil qoʻshildi (Match ID: {match_id}).")
+    
+    # Obunachilarga xabar yuborish
     subscribers = await get_subscribers_for_match(match_id)
     if subscribers:
         sent_count = 0
@@ -998,7 +1100,7 @@ async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not FOOTBALL_DATA_KEY:
         await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
         return
-    await update.message.reply_text("✅ API kaliti mavjud.")
+    await update.message.reply_text("✅ API kaliti mavjud. Tez orada sinovdan o'tadi.")
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not FOOTBALL_DATA_KEY:
@@ -1014,7 +1116,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul + Share + Bonus + Referal Notify)")
+    return web.Response(text="✅ Bot ishlamoqda (Optimized + Rate Limit)")
 
 async def run_web_server():
     app = web.Application()
@@ -1047,7 +1149,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul + Share + Bonus + Referal Notify)")
+    logger.info("🤖 Bot ishga tushdi! (Optimized + Rate Limit)")
     asyncio.create_task(notification_scheduler(application))
     while True:
         await asyncio.sleep(3600)
