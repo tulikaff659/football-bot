@@ -20,7 +20,6 @@ FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY")
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_KEY}
 
-# Top 5 chempionat
 TOP_LEAGUES = {
     "PL": {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
     "PD": {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
@@ -29,7 +28,6 @@ TOP_LEAGUES = {
     "FL1": {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
 }
 
-# Ishonchli futbol saytlari
 TRUSTED_SITES = {
     "PL": {
         "base": "https://www.espn.com/soccer/match/_/gameId/{}",
@@ -57,16 +55,15 @@ TRUSTED_SITES = {
 DAYS_AHEAD = 7
 DB_PATH = "data/bot.db"
 
-# ========== REFERRAL TIZIMI ==========
-REFERRAL_BONUS = 2000          # Har bir referal uchun 2000 soʻm
-MIN_WITHDRAW = 50000           # Minimal yechish miqdori 50.000 soʻm
-MAX_WITHDRAW_DAILY = 1         # Kuniga 1 marta yechish
+# ========== REFERRAL ==========
+REFERRAL_BONUS = 2000
+MIN_WITHDRAW = 50000
+MAX_WITHDRAW_DAILY = 1
 
-# ========== MAʼLUMOTLAR BAZASI ==========
+# ========== DATABASE ==========
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-        # Adminlar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -74,7 +71,6 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Tahlillar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS match_analyses (
                 match_id INTEGER PRIMARY KEY,
@@ -83,7 +79,6 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Obunalar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
                 user_id INTEGER,
@@ -99,7 +94,6 @@ async def init_db():
                 PRIMARY KEY (user_id, match_id)
             )
         ''')
-        # Foydalanuvchilar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -111,7 +105,6 @@ async def init_db():
                 FOREIGN KEY (referrer_id) REFERENCES users(user_id)
             )
         ''')
-        # Referallar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS referrals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -122,7 +115,6 @@ async def init_db():
                 UNIQUE(referred_id)
             )
         ''')
-        # Yechimlar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -133,8 +125,6 @@ async def init_db():
             )
         ''')
         await db.commit()
-
-    # Asosiy admin
     MAIN_ADMIN = 6935090105
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
@@ -143,7 +133,7 @@ async def init_db():
                 await db.commit()
                 logger.info(f"Asosiy admin qo'shildi: {MAIN_ADMIN}")
 
-# ========== FOYDALANUVCHI FUNKSIYALARI ==========
+# ========== USER FUNCTIONS ==========
 async def get_or_create_user(user_id: int, referrer_id: int = None):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
@@ -209,7 +199,7 @@ async def get_referral_stats(user_id: int):
             today_count = row[0] if row else 0
     return {"count": count, "total_bonus": total_bonus, "today_count": today_count}
 
-# ========== ADMIN FUNKSIYALARI ==========
+# ========== ADMIN ==========
 async def is_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,)) as cursor:
@@ -235,7 +225,7 @@ async def get_all_admins():
         async with db.execute('SELECT user_id, added_by, added_at FROM admins ORDER BY added_at') as cursor:
             return await cursor.fetchall()
 
-# ========== TAHLIL FUNKSIYALARI ==========
+# ========== ANALYSIS ==========
 async def add_analysis(match_id: int, analysis: str, added_by: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
@@ -253,7 +243,7 @@ async def get_analysis(match_id: int):
         async with db.execute('SELECT analysis, added_at FROM match_analyses WHERE match_id = ?', (match_id,)) as cursor:
             return await cursor.fetchone()
 
-# ========== OBUNA FUNKSIYALARI ==========
+# ========== SUBSCRIPTIONS ==========
 async def subscribe_user(user_id: int, match_id: int, match_time: str, home: str, away: str, league_code: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
@@ -333,7 +323,7 @@ async def fetch_match_by_id(match_id: int):
         logger.exception("Ulanish xatosi")
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
-# ========== TARKIBLAR ==========
+# ========== LINEUPS ==========
 async def fetch_match_lineups(match_id: int):
     result = await fetch_match_by_id(match_id)
     if "error" in result:
@@ -437,7 +427,7 @@ def format_links_message(links):
         msg += f"• [{name}]({url})\n"
     return msg
 
-# ========== INLINE TUGMALAR (HAMMA JOYDA PUL QATORI BILAN) ==========
+# ========== INLINE KEYBOARDS ==========
 def money_row():
     """Pul ishlash tugmalari qatori (barcha klaviaturaga qo‘shiladi)"""
     return [
@@ -450,7 +440,7 @@ def get_leagues_keyboard():
     keyboard = []
     for code, data in TOP_LEAGUES.items():
         keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{code}")])
-    keyboard.append(money_row())  # 💰💳💸 qatori
+    keyboard.append(money_row())
     return InlineKeyboardMarkup(keyboard)
 
 def build_matches_keyboard(matches):
@@ -466,32 +456,27 @@ def build_matches_keyboard(matches):
         callback_data = f"match_{match_id}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
     keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
-    keyboard.append(money_row())  # 💰💳💸 qatori
+    keyboard.append(money_row())
     return InlineKeyboardMarkup(keyboard)
 
 def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False, lineups_available: bool = False):
     keyboard = []
-    # 1-qator: kuzatish / bekor qilish
     if is_subscribed:
         keyboard.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{match_id}")])
     else:
         keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
-    # 2-qator: tashqi havolalar
     keyboard.append([
         InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
         InlineKeyboardButton("📊 Chuqur tahlil", url="http://test.com"),
         InlineKeyboardButton("🎲 Stavka qilish", url="http://test2.com")
     ])
-    # 3-qator: tarkiblar (agar mavjud bo'lsa)
     if lineups_available:
         keyboard.append([InlineKeyboardButton("📋 Tarkiblarni ko‘rish", callback_data=f"lineups_{match_id}")])
-    # 4-qator: orqaga
     keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
-    # 5-qator: pul ishlash tugmalari
     keyboard.append(money_row())
     return InlineKeyboardMarkup(keyboard)
 
-# ========== TELEGRAM HANDLERLAR ==========
+# ========== HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     user_id = user.id
@@ -520,7 +505,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         welcome_text,
         parse_mode="Markdown",
-        reply_markup=get_leagues_keyboard()  # ✅ ligalar + pul qatori
+        reply_markup=get_leagues_keyboard()
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -529,7 +514,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
 
-    # ---------- PUL ISHLASH INFO (YANGI XABAR) ----------
+    # ---------- PUL ISHLASH INFO (YANGI XABAR) + SHARE TUGMASI ----------
     if data == "money_info":
         bot_username = (await context.bot.get_me()).username
         referral_link = await get_referral_link(user_id, bot_username)
@@ -548,14 +533,31 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 **Sizning referal havolangiz:**\n`{referral_link}`\n\n"
             f"⚠️ Doʻstingiz botga start bosganida bonus avtomatik hisoblanadi."
         )
-        back_keyboard = InlineKeyboardMarkup([
+
+        # 📤 Share tugmasi uchun maxsus xabar va havola
+        share_text = (
+            f"🤖 Futbol tahlillari va pul ishlash botiga taklif!\n\n"
+            f"Bot orqali top-5 chempionat oʻyinlarini kuzating, tahlillarni oling va "
+            f"doʻstlaringizni taklif qilib pul ishlang.\n\n"
+            f"🎁 Har bir taklif uchun +{REFERRAL_BONUS:,} soʻm bonus!\n"
+            f"👇 Quyidagi havola orqali botga oʻting:\n{referral_link}"
+        )
+        # Telegram share URL
+        from urllib.parse import quote
+        share_url = f"https://t.me/share/url?url={quote(referral_link)}&text={quote(share_text)}"
+
+        # Tugmalar: share + bosh menyu + pul qatori
+        keyboard = [
+            [InlineKeyboardButton("📤 Do'stlarga yuborish", url=share_url)],
             [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
             money_row()
-        ])
+        ]
+        back_keyboard = InlineKeyboardMarkup(keyboard)
+
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
         return
 
-    # ---------- BALANS KO'RISH (YANGI XABAR) ----------
+    # ---------- BALANS KO'RISH ----------
     if data == "balance_info":
         balance = await get_user_balance(user_id)
         stats = await get_referral_stats(user_id)
@@ -574,7 +576,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
         return
 
-    # ---------- PUL YECHISH (YANGI XABAR) ----------
+    # ---------- PUL YECHISH ----------
     if data == "withdraw_info":
         balance = await get_user_balance(user_id)
         if balance < MIN_WITHDRAW:
@@ -616,9 +618,8 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("❌ Xatolik yuz berdi. Qayta urinib koʻring.", reply_markup=back_keyboard)
         return
 
-    # ---------- BACK TO START (BOSH MENYUGA QAYTISH) ----------
+    # ---------- BOSH MENYU ----------
     if data == "back_to_start":
-        # Start xabarini yuborish (yangi xabar)
         user = update.effective_user
         await get_or_create_user(user_id, None)
         bot_username = (await context.bot.get_me()).username
@@ -636,8 +637,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_leagues_keyboard())
         return
 
-    # ---------- FUTBOL QISMI (LIGALAR, O‘YINLAR, KUZATISH) ----------
-    # Ligalarga qaytish
+    # ---------- FUTBOL QISMI (LIGALAR, OʻYINLAR, KUZATISH) ----------
     if data == "leagues":
         await query.edit_message_text(
             "Quyidagi chempionatlardan birini tanlang:",
@@ -645,7 +645,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Liga tanlash
     if data.startswith("league_"):
         league_code = data.split("_")[1]
         league_info = TOP_LEAGUES.get(league_code)
@@ -673,7 +672,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Oʻyin tahlilini koʻrish
     if data.startswith("match_"):
         match_id = int(data.split("_")[1])
         analysis = await get_analysis(match_id)
@@ -706,7 +704,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # Tarkiblarni ko'rish
     if data.startswith("lineups_"):
         match_id = int(data.split("_")[1])
         await query.edit_message_text("⏳ Tarkiblar yuklanmoqda...")
@@ -736,7 +733,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # Obuna bo'lish
     if data.startswith("subscribe_"):
         match_id = int(data.split("_")[1])
         result = await fetch_match_by_id(match_id)
@@ -755,7 +751,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("✅ Kuzatish boshlandi!", show_alert=False)
         return
 
-    # Obunani bekor qilish
     if data.startswith("unsubscribe_"):
         match_id = int(data.split("_")[1])
         await unsubscribe_user(user_id, match_id)
@@ -764,7 +759,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("❌ Kuzatish bekor qilindi", show_alert=False)
         return
 
-# ========== NOTIFIKATSIYA SCHEDULERI ==========
+# ========== NOTIFICATION SCHEDULER ==========
 async def notification_scheduler(app: Application):
     while True:
         try:
@@ -811,7 +806,7 @@ async def notification_scheduler(app: Application):
             logger.exception(f"Notification scheduler error: {e}")
         await asyncio.sleep(60)
 
-# ========== ADMIN BUYRUQLARI ==========
+# ========== ADMIN COMMANDS ==========
 async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await is_admin(user.id):
@@ -931,7 +926,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul)")
+    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul + Share)")
 
 async def run_web_server():
     app = web.Application()
@@ -943,7 +938,7 @@ async def run_web_server():
     await site.start()
     logger.info(f"Web server port {port} da ishga tushdi")
 
-# ========== ASOSIY ==========
+# ========== MAIN ==========
 async def run_bot():
     token = os.environ.get("BOT_TOKEN")
     if not token:
@@ -964,7 +959,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul integratsiyasi)")
+    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul + Share)")
     asyncio.create_task(notification_scheduler(application))
     while True:
         await asyncio.sleep(3600)
