@@ -3,9 +3,9 @@ import asyncio
 import logging
 import aiohttp
 import aiosqlite
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # ---------- SOZLAMALAR ----------
@@ -29,7 +29,7 @@ TOP_LEAGUES = {
     "FL1": {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
 }
 
-# Ishonchli futbol saytlari (liga va jamoa bo‘yicha havola generatorlari)
+# Ishonchli futbol saytlari
 TRUSTED_SITES = {
     "PL": {
         "base": "https://www.espn.com/soccer/match/_/gameId/{}",
@@ -54,14 +54,19 @@ TRUSTED_SITES = {
     }
 }
 
-# Necha kun ichidagi o'yinlar
 DAYS_AHEAD = 7
 DB_PATH = "data/bot.db"
+
+# ========== REFERRAL TIZIMI UCHUN SOZLAMALAR ==========
+REFERRAL_BONUS = 2000          # Har bir referal uchun 2000 soʻm
+MIN_WITHDRAW = 50000           # Minimal yechish miqdori 50.000 soʻm
+MAX_WITHDRAW_DAILY = 1         # Kuniga 1 marta yechish
 
 # ========== MAʼLUMOTLAR BAZASI ==========
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+        # Adminlar jadvali
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -69,6 +74,7 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Tahlillar jadvali
         await db.execute('''
             CREATE TABLE IF NOT EXISTS match_analyses (
                 match_id INTEGER PRIMARY KEY,
@@ -77,6 +83,7 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Obunalar jadvali
         await db.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
                 user_id INTEGER,
@@ -92,8 +99,45 @@ async def init_db():
                 PRIMARY KEY (user_id, match_id)
             )
         ''')
+        
+        # ========== YANGI JADVALLAR (REFERRAL TIZIMI) ==========
+        # Foydalanuvchilar jadvali
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                balance INTEGER DEFAULT 0,
+                referrer_id INTEGER,
+                referral_count INTEGER DEFAULT 0,
+                daily_withdraw_date TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (referrer_id) REFERENCES users(user_id)
+            )
+        ''')
+        # Referallar jadvali (bonuslar tarixi)
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER NOT NULL,
+                referred_id INTEGER NOT NULL,
+                bonus INTEGER DEFAULT 2000,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(referred_id)
+            )
+        ''')
+        # Yechimlar jadvali
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
         await db.commit()
 
+    # Asosiy adminni qo'shish
     MAIN_ADMIN = 6935090105
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
@@ -102,6 +146,118 @@ async def init_db():
                 await db.commit()
                 logger.info(f"Asosiy admin qo'shildi: {MAIN_ADMIN}")
 
+# ========== FOYDALANUVCHI FUNKSIYALARI ==========
+async def get_or_create_user(user_id: int, referrer_id: int = None):
+    """Foydalanuvchini bazaga qo'shish yoki olish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            user = await cursor.fetchone()
+        
+        if not user:
+            # Yangi foydalanuvchi
+            await db.execute(
+                'INSERT INTO users (user_id, referrer_id) VALUES (?, ?)',
+                (user_id, referrer_id)
+            )
+            await db.commit()
+            
+            # Agar referrer bo'lsa, bonus berish
+            if referrer_id and referrer_id != user_id:
+                # Tekshirish: referrer mavjudmi?
+                async with db.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,)) as cursor:
+                    if await cursor.fetchone():
+                        # Bonus berish
+                        await db.execute(
+                            'UPDATE users SET balance = balance + ?, referral_count = referral_count + 1 WHERE user_id = ?',
+                            (REFERRAL_BONUS, referrer_id)
+                        )
+                        # Referralni qayd etish
+                        await db.execute(
+                            'INSERT OR IGNORE INTO referrals (referrer_id, referred_id, bonus) VALUES (?, ?, ?)',
+                            (referrer_id, user_id, REFERRAL_BONUS)
+                        )
+                        await db.commit()
+                        logger.info(f"Referal bonus: {referrer_id} +{REFERRAL_BONUS} (yangi foydalanuvchi {user_id})")
+            
+            async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
+                user = await cursor.fetchone()
+        
+        return user
+
+async def get_user_balance(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else 0
+
+async def update_balance(user_id: int, amount: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('UPDATE users SET balance = balance + ? WHERE user_id = ?', (amount, user_id))
+        await db.commit()
+
+async def can_withdraw(user_id: int) -> tuple:
+    """Foydalanuvchi pul yechish mumkinligini tekshiradi. (mumkinmi, xabar)"""
+    balance = await get_user_balance(user_id)
+    if balance < MIN_WITHDRAW:
+        return False, f"❌ Minimal yechish miqdori {MIN_WITHDRAW:,} soʻm. Sizda {balance:,} soʻm bor."
+    
+    today_str = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            'SELECT daily_withdraw_date FROM users WHERE user_id = ?', 
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] == today_str:
+                return False, "❌ Bugun siz allaqachon pul yechib boʻlgansiz. Ertaga qayta urinib koʻring."
+    
+    return True, ""
+
+async def register_withdraw(user_id: int, amount: int) -> bool:
+    """Pul yechishni qayd etish"""
+    can, msg = await can_withdraw(user_id)
+    if not can:
+        return False
+    if amount > await get_user_balance(user_id):
+        return False
+    
+    today_str = date.today().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Balansni kamaytirish
+        await db.execute('UPDATE users SET balance = balance - ?, daily_withdraw_date = ? WHERE user_id = ?', 
+                         (amount, today_str, user_id))
+        # Yechimni qayd etish
+        await db.execute('INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, ?)',
+                         (user_id, amount, 'completed'))
+        await db.commit()
+    return True
+
+async def get_referral_link(user_id: int, bot_username: str) -> str:
+    """Foydalanuvchi uchun referal havola yaratish"""
+    return f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+async def get_referral_stats(user_id: int):
+    """Referal statistikasini olish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT referral_count FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            count = row[0] if row else 0
+        
+        async with db.execute('SELECT SUM(bonus) FROM referrals WHERE referrer_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            total_bonus = row[0] if row[0] else 0
+        
+        async with db.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND DATE(created_at) = DATE("now")', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            today_count = row[0] if row else 0
+        
+        return {
+            "count": count,
+            "total_bonus": total_bonus,
+            "today_count": today_count
+        }
+
+# ========== ADMIN FUNKSIYALARI ==========
 async def is_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,)) as cursor:
@@ -127,6 +283,7 @@ async def get_all_admins():
         async with db.execute('SELECT user_id, added_by, added_at FROM admins ORDER BY added_at') as cursor:
             return await cursor.fetchall()
 
+# ========== TAHLIL FUNKSIYALARI ==========
 async def add_analysis(match_id: int, analysis: str, added_by: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
@@ -144,7 +301,7 @@ async def get_analysis(match_id: int):
         async with db.execute('SELECT analysis, added_at FROM match_analyses WHERE match_id = ?', (match_id,)) as cursor:
             return await cursor.fetchone()
 
-# ========== OBUNA TIZIMI ==========
+# ========== OBUNA FUNKSIYALARI ==========
 async def subscribe_user(user_id: int, match_id: int, match_time: str, home: str, away: str, league_code: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
@@ -224,7 +381,7 @@ async def fetch_match_by_id(match_id: int):
         logger.exception("Ulanish xatosi")
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
-# ========== TARKIBLARNI OLISH VA FORMATLASH ==========
+# ========== TARKIBLAR ==========
 async def fetch_match_lineups(match_id: int):
     result = await fetch_match_by_id(match_id)
     if "error" in result:
@@ -328,7 +485,19 @@ def format_links_message(links):
         msg += f"• [{name}]({url})\n"
     return msg
 
-# ========== INLINE TUGMALAR ==========
+# ========== ASOSIY INLINE TUGMALAR (PUL ISHLASH, BALANS, PUL YECHISH) ==========
+def get_main_inline_keyboard():
+    """Barcha xabarlar tagida ko'rinadigan tugmalar"""
+    keyboard = [
+        [
+            InlineKeyboardButton("💰 Pul ishlash", callback_data="referral_info"),
+            InlineKeyboardButton("💳 Balans", callback_data="show_balance"),
+            InlineKeyboardButton("💸 Pul yechish", callback_data="withdraw_request")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ========== INLINE TUGMALAR (FUTBOL) ==========
 def get_leagues_keyboard():
     keyboard = []
     for code, data in TOP_LEAGUES.items():
@@ -351,38 +520,62 @@ def build_matches_keyboard(matches):
     return InlineKeyboardMarkup(keyboard)
 
 def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False, lineups_available: bool = False):
-    """Oʻyin tahlili sahifasidagi tugmalar"""
     keyboard = []
-    
-    # 1-qator: Kuzatish / Bekor qilish
     if is_subscribed:
         keyboard.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{match_id}")])
     else:
         keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
     
-    # 2-qator: Qo'shimcha tashqi havolalar (YANGI)
+    # Qo'shimcha tashqi havolalar
     keyboard.append([
         InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
         InlineKeyboardButton("📊 Chuqur tahlil", url="http://test.com"),
         InlineKeyboardButton("🎲 Stavka qilish", url="http://test2.com")
     ])
     
-    # 3-qator: Tarkiblarni ko'rish (agar mavjud bo'lsa)
     if lineups_available:
         keyboard.append([InlineKeyboardButton("📋 Tarkiblarni ko‘rish", callback_data=f"lineups_{match_id}")])
     
-    # 4-qator: Orqaga
     keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
-    
     return InlineKeyboardMarkup(keyboard)
 
 # ========== TELEGRAM HANDLERLAR ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    user_id = user.id
+    args = context.args
+    
+    referrer_id = None
+    if args and args[0].startswith("ref_"):
+        try:
+            referrer_id = int(args[0].replace("ref_", ""))
+            if referrer_id == user_id:
+                referrer_id = None
+        except:
+            referrer_id = None
+    
+    # Foydalanuvchini bazaga qo'shish (agar referrer bo'lsa, bonus beriladi)
+    await get_or_create_user(user_id, referrer_id)
+    
+    bot_username = (await context.bot.get_me()).username
+    referral_link = await get_referral_link(user_id, bot_username)
+    
+    welcome_text = (
+        f"👋 Assalomu alaykum, {user.first_name}!\n\n"
+        f"⚽ Ushbu bot orqali top 5 chempionat oʻyinlarini kuzatishingiz, "
+        f"tahlillarni olishingiz va oʻyinlar haqida eslatmalarni sozlashingiz mumkin.\n\n"
+        f"💰 **Pul ishlash imkoniyati**:\n"
+        f"Doʻstlaringizni taklif qiling va har bir taklif uchun **{REFERRAL_BONUS:,} soʻm** oling!\n"
+        f"Sizning referal havolangiz:\n`{referral_link}`\n\n"
+        f"💸 Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**, kuniga **1 marta**.\n\n"
+        f"Quyidagi tugmalar orqali balans, referal va pul yechish boʻlimlariga oʻting."
+    )
+    
+    # Asosiy tugmalar bilan birga xabar yuborish
     await update.message.reply_text(
-        f"👋 Assalomu alaykum, {user.first_name}!\n"
-        f"Quyidagi chempionatlardan birini tanlang – {DAYS_AHEAD} kun ichidagi oʻyinlar:",
-        reply_markup=get_leagues_keyboard()
+        welcome_text,
+        parse_mode="Markdown",
+        reply_markup=get_main_inline_keyboard()
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -390,8 +583,93 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     user_id = update.effective_user.id
-
-    # ---------- Ligalarga qaytish ----------
+    
+    # ---------- REFERRAL / PUL ISHLASH INFO ----------
+    if data == "referral_info":
+        bot_username = (await context.bot.get_me()).username
+        referral_link = await get_referral_link(user_id, bot_username)
+        stats = await get_referral_stats(user_id)
+        balance = await get_user_balance(user_id)
+        
+        text = (
+            f"💰 **Pul ishlash tizimi**\n\n"
+            f"• Har bir doʻstingizni taklif qilish uchun: **+{REFERRAL_BONUS:,} soʻm**\n"
+            f"• Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**\n"
+            f"• Kuniga **1 marta** pul yechish mumkin.\n\n"
+            f"📊 **Sizning statistika:**\n"
+            f"• Balans: **{balance:,} soʻm**\n"
+            f"• Taklif qilinganlar: **{stats['count']} ta**\n"
+            f"• Bugun taklif qilingan: **{stats['today_count']} ta**\n"
+            f"• Jami bonus: **{stats['total_bonus']:,} soʻm**\n\n"
+            f"🔗 **Sizning referal havolangiz:**\n`{referral_link}`\n\n"
+            f"⚠️ Doʻstingiz botga start bosganida bonus avtomatik hisoblanadi."
+        )
+        
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_inline_keyboard())
+        return
+    
+    # ---------- BALANS KO'RISH ----------
+    if data == "show_balance":
+        balance = await get_user_balance(user_id)
+        stats = await get_referral_stats(user_id)
+        
+        text = (
+            f"💳 **Sizning balansingiz**\n\n"
+            f"💰 Balans: **{balance:,} soʻm**\n"
+            f"👥 Referallar: **{stats['count']} ta**\n"
+            f"🎁 Bonus: **{stats['total_bonus']:,} soʻm**\n\n"
+            f"💸 Pul yechish uchun minimal miqdor: **{MIN_WITHDRAW:,} soʻm**\n"
+            f"📅 Kuniga **1 marta** yechish mumkin."
+        )
+        
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=get_main_inline_keyboard())
+        return
+    
+    # ---------- PUL YECHISH SOROVI ----------
+    if data == "withdraw_request":
+        balance = await get_user_balance(user_id)
+        
+        if balance < MIN_WITHDRAW:
+            await query.edit_message_text(
+                f"❌ Sizda yetarli mablagʻ yoʻq.\n"
+                f"Balans: **{balance:,} soʻm**\n"
+                f"Minimal yechish: **{MIN_WITHDRAW:,} soʻm**\n\n"
+                f"Doʻstlaringizni taklif qilib pul ishlang!",
+                parse_mode="Markdown",
+                reply_markup=get_main_inline_keyboard()
+            )
+            return
+        
+        can, msg = await can_withdraw(user_id)
+        if not can:
+            await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=get_main_inline_keyboard())
+            return
+        
+        # Pul yechishni amalga oshirish (balansdan olib tashlash va kunlik limitni belgilash)
+        success = await register_withdraw(user_id, MIN_WITHDRAW)
+        if success:
+            # Tashqi havolaga yo'naltirish tugmasi
+            withdraw_keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("💸 Pul yechish (test)", url="http://test.com/withdraw")],
+                [InlineKeyboardButton("🔙 Orqaga", callback_data="show_balance")]
+            ])
+            await query.edit_message_text(
+                f"✅ **Pul yechish soʻrovingiz qabul qilindi!**\n\n"
+                f"Yechilgan miqdor: **{MIN_WITHDRAW:,} soʻm**\n"
+                f"Qolgan balans: **{balance - MIN_WITHDRAW:,} soʻm**\n\n"
+                f"⚠️ Bu test rejimi. Pul yechish uchun quyidagi havolaga oʻting:",
+                parse_mode="Markdown",
+                reply_markup=withdraw_keyboard
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Xatolik yuz berdi. Qayta urinib koʻring.",
+                reply_markup=get_main_inline_keyboard()
+            )
+        return
+    
+    # ---------- Futbol qismi (avvalgi kod) ----------
+    # Ligalarga qaytish
     if data == "leagues":
         await query.edit_message_text(
             "Quyidagi chempionatlardan birini tanlang:",
@@ -399,7 +677,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- Liga tanlash ----------
+    # Liga tanlash
     if data.startswith("league_"):
         league_code = data.split("_")[1]
         league_info = TOP_LEAGUES.get(league_code)
@@ -427,7 +705,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------- Oʻyin tahlilini koʻrish ----------
+    # Oʻyin tahlilini koʻrish
     if data.startswith("match_"):
         match_id = int(data.split("_")[1])
         analysis = await get_analysis(match_id)
@@ -462,10 +740,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lineups_available = lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup'])
         
         keyboard = build_match_detail_keyboard(match_id, is_subscribed, lineups_available)
+        # Asosiy pul tugmalarini qo'shamiz (2-qator yoki alohida qilib)
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+        # Pul tugmalarini alohida xabar sifatida yuborish
+        await query.message.reply_text("Quyidagi tugmalar orqali pul ishlash tizimiga oʻting:", reply_markup=get_main_inline_keyboard())
         return
 
-    # ---------- Tarkiblarni ko'rish ----------
+    # Tarkiblarni ko'rish
     if data.startswith("lineups_"):
         match_id = int(data.split("_")[1])
         await query.edit_message_text("⏳ Tarkiblar yuklanmoqda...")
@@ -496,7 +777,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # ---------- Obuna bo'lish ----------
+    # Obuna bo'lish
     if data.startswith("subscribe_"):
         match_id = int(data.split("_")[1])
         result = await fetch_match_by_id(match_id)
@@ -515,7 +796,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("✅ Kuzatish boshlandi! Tarkiblar va eslatmalarni olasiz.", show_alert=False)
         return
 
-    # ---------- Obunani bekor qilish ----------
+    # Obunani bekor qilish
     if data.startswith("unsubscribe_"):
         match_id = int(data.split("_")[1])
         await unsubscribe_user(user_id, match_id)
@@ -648,6 +929,35 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         text += f"• `{aid}` – qo'shdi: `{added_by}`, {added_at_dt.strftime('%d.%m.%Y')}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
+# ========== ADMIN UCHUN STATISTIKA ==========
+async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not await is_admin(user.id):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
+            total_users = (await cursor.fetchone())[0]
+        async with db.execute('SELECT COUNT(*) FROM referrals') as cursor:
+            total_refs = (await cursor.fetchone())[0]
+        async with db.execute('SELECT SUM(balance) FROM users') as cursor:
+            total_balance = (await cursor.fetchone())[0] or 0
+        async with db.execute('SELECT COUNT(*) FROM withdrawals WHERE status="completed"') as cursor:
+            total_withdrawals = (await cursor.fetchone())[0]
+        async with db.execute('SELECT SUM(amount) FROM withdrawals WHERE status="completed"') as cursor:
+            total_withdrawn = (await cursor.fetchone())[0] or 0
+    
+    text = (
+        f"📊 **Bot statistikasi**\n\n"
+        f"👥 Foydalanuvchilar: {total_users}\n"
+        f"🔗 Referallar: {total_refs}\n"
+        f"💰 Jami balans: {total_balance:,} soʻm\n"
+        f"💸 Yechimlar soni: {total_withdrawals}\n"
+        f"💵 Jami yechilgan: {total_withdrawn:,} soʻm"
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
+
 # ========== TEST / DEBUG ==========
 async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not FOOTBALL_DATA_KEY:
@@ -669,7 +979,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Qoʻshimcha tugmalar bilan)")
+    return web.Response(text="✅ Bot ishlamoqda (Referral tizimi bilan)")
 
 async def run_web_server():
     app = web.Application()
@@ -691,9 +1001,11 @@ async def run_bot():
     await init_db()
     application = Application.builder().token(token).build()
 
+    # Handlerlar
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_api))
     application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("stats", admin_stats_command))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CommandHandler("addanalysis", add_analysis_command))
@@ -704,7 +1016,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Qoʻshimcha tugmalar qoʻshildi)")
+    logger.info("🤖 Bot ishga tushdi! (Referral tizimi va pul ishlash qoʻshildi)")
 
     asyncio.create_task(notification_scheduler(application))
 
