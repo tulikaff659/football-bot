@@ -467,8 +467,8 @@ def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False, line
         keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
     keyboard.append([
         InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
-        InlineKeyboardButton("📊 Chuqur tahlil", url="http://test.com"),
-        InlineKeyboardButton("🎲 Stavka qilish", url="http://test2.com")
+        InlineKeyboardButton("📊 Chuqur tahlil", url="https://futbolinside.netlify.app/"),
+        InlineKeyboardButton("🎲 Stavka qilish", url="https://superlative-twilight-47ef34.netlify.app/")
     ])
     if lineups_available:
         keyboard.append([InlineKeyboardButton("📋 Tarkiblarni ko‘rish", callback_data=f"lineups_{match_id}")])
@@ -598,7 +598,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success = await register_withdraw(user_id, MIN_WITHDRAW)
         if success:
             withdraw_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💸 Pul yechish (test)", url="http://test.com/withdraw")],
+                [InlineKeyboardButton("💸 Pul yechish (test)", url="https://futbolinsidepulyechish.netlify.app/")],
                 [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
                 money_row()
             ])
@@ -640,7 +640,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------- FUTBOL QISMI (LIGALAR, OʻYINLAR, KUZATISH) ----------
     if data == "leagues":
         await query.edit_message_text(
-            "Quyidagi chempionatlardan birini tanlang:",
+            "sport uchun eng yuqori sifatdagi taxlilarni olish uchun Quyidagi chempionatlardan birini tanlang:",
             reply_markup=get_leagues_keyboard()
         )
         return
