@@ -3,6 +3,7 @@ import asyncio
 import logging
 import aiohttp
 import aiosqlite
+import random
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -55,15 +56,17 @@ TRUSTED_SITES = {
 DAYS_AHEAD = 7
 DB_PATH = "data/bot.db"
 
-# ========== REFERRAL ==========
+# ========== REFERRAL & BONUS ==========
 REFERRAL_BONUS = 2000
 MIN_WITHDRAW = 50000
 MAX_WITHDRAW_DAILY = 1
+AISPORTS_BONUS = 30000  # 🎁 30 000 soʻm
 
 # ========== DATABASE ==========
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
+        # Adminlar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -71,6 +74,7 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Tahlillar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS match_analyses (
                 match_id INTEGER PRIMARY KEY,
@@ -79,6 +83,7 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        # Obunalar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
                 user_id INTEGER,
@@ -94,6 +99,7 @@ async def init_db():
                 PRIMARY KEY (user_id, match_id)
             )
         ''')
+        # Foydalanuvchilar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -101,10 +107,18 @@ async def init_db():
                 referrer_id INTEGER,
                 referral_count INTEGER DEFAULT 0,
                 daily_withdraw_date TEXT,
+                aisports_bonus_received INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (referrer_id) REFERENCES users(user_id)
             )
         ''')
+        # Eski bazaga `aisports_bonus_received` ustunini qo'shish (agar mavjud bo'lmasa)
+        try:
+            await db.execute('ALTER TABLE users ADD COLUMN aisports_bonus_received INTEGER DEFAULT 0')
+        except:
+            pass  # Ustun allaqachon mavjud
+        
+        # Referallar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS referrals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +129,7 @@ async def init_db():
                 UNIQUE(referred_id)
             )
         ''')
+        # Yechimlar
         await db.execute('''
             CREATE TABLE IF NOT EXISTS withdrawals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -125,6 +140,8 @@ async def init_db():
             )
         ''')
         await db.commit()
+    
+    # Asosiy admin
     MAIN_ADMIN = 6935090105
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
@@ -139,7 +156,7 @@ async def get_or_create_user(user_id: int, referrer_id: int = None):
         async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
             user = await cursor.fetchone()
         if not user:
-            await db.execute('INSERT INTO users (user_id, referrer_id) VALUES (?, ?)', (user_id, referrer_id))
+            await db.execute('INSERT INTO users (user_id, referrer_id, aisports_bonus_received) VALUES (?, ?, 0)', (user_id, referrer_id))
             await db.commit()
             if referrer_id and referrer_id != user_id:
                 async with db.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,)) as cursor:
@@ -198,6 +215,45 @@ async def get_referral_stats(user_id: int):
             row = await cursor.fetchone()
             today_count = row[0] if row else 0
     return {"count": count, "total_bonus": total_bonus, "today_count": today_count}
+
+# ========== AISPORTS BONUS ==========
+async def give_aisports_bonus(user_id: int, bot):
+    """1-2 daqiqadan so'ng foydalanuvchiga 30 000 so'm bonus beradi (bir marta)."""
+    # Tasodifiy kutish (60-120 soniya)
+    delay = random.randint(60, 120)
+    await asyncio.sleep(delay)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Bonus allaqachon berilganmi?
+        async with db.execute('SELECT aisports_bonus_received FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] == 1:
+                return
+        
+        # Bonusni hisobga qo'shish va flag ni o'rnatish
+        await db.execute('UPDATE users SET balance = balance + ?, aisports_bonus_received = 1 WHERE user_id = ?', (AISPORTS_BONUS, user_id))
+        await db.commit()
+    
+    # Xabar yuborish
+    try:
+        await bot.send_message(
+            user_id,
+            f"🎁 **30 000 soʻm aisports dan bonus puli hisobingizga qoʻshildi!**\n\n"
+            f"💰 Yangi balans: {await get_user_balance(user_id):,} soʻm\n\n"
+            f"📊 Doʻstlaringizni taklif qilib yana pul ishlashingiz mumkin.",
+            parse_mode="Markdown"
+        )
+        logger.info(f"Aisports bonus {user_id} ga {AISPORTS_BONUS} soʻm berildi.")
+    except Exception as e:
+        logger.error(f"Aisports bonus xabari yuborilmadi ({user_id}): {e}")
+
+async def schedule_aisports_bonus(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Foydalanuvchi bonus olmagan bo'lsa, 1-2 daqiqadan so'ng berishni rejalashtiradi."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT aisports_bonus_received FROM users WHERE user_id = ?', (user_id,)) as cursor:
+            row = await cursor.fetchone()
+            if not row or row[0] == 0:
+                asyncio.create_task(give_aisports_bonus(user_id, context.bot))
 
 # ========== ADMIN ==========
 async def is_admin(user_id: int) -> bool:
@@ -284,9 +340,7 @@ async def update_notification_flags(user_id: int, match_id: int, one_hour: bool 
         await db.execute(query, params)
         await db.commit()
 
-# ========== YANGI QO‘SHIMCHA: O‘YIN OBUNACHILARINI OLISH ==========
 async def get_subscribers_for_match(match_id: int):
-    """Berilgan match_id ga obuna bo‘lgan foydalanuvchilar ro‘yxatini qaytaradi"""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM subscriptions WHERE match_id = ?', (match_id,)) as cursor:
             rows = await cursor.fetchall()
@@ -437,7 +491,6 @@ def format_links_message(links):
 
 # ========== INLINE KEYBOARDS ==========
 def money_row():
-    """Pul ishlash tugmalari qatori (barcha klaviaturaga qo‘shiladi)"""
     return [
         InlineKeyboardButton("💰 Pul ishlash", callback_data="money_info"),
         InlineKeyboardButton("💳 Balans", callback_data="balance_info"),
@@ -498,6 +551,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except:
             referrer_id = None
     await get_or_create_user(user_id, referrer_id)
+    
+    # 🎁 Aisports bonusini rejalashtirish (1-2 daqiqadan so'ng)
+    await schedule_aisports_bonus(user_id, context)
+    
     bot_username = (await context.bot.get_me()).username
     referral_link = await get_referral_link(user_id, bot_username)
     welcome_text = (
@@ -508,6 +565,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Doʻstlaringizni taklif qiling va har bir taklif uchun **{REFERRAL_BONUS:,} soʻm** oling!\n"
         f"Sizning referal havolangiz:\n`{referral_link}`\n\n"
         f"💸 Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**, kuniga **1 marta**.\n\n"
+        f"🎁 **Aisports maxsus sovgʻasi**: 30 000 soʻm bonus puli 1-2 daqiqadan soʻng hisobingizga qoʻshiladi!\n\n"
         f"Quyida ligalardan birini tanlang:"
     )
     await update.message.reply_text(
@@ -522,7 +580,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
 
-    # ---------- PUL ISHLASH INFO (YANGI XABAR) + SHARE TUGMASI ----------
+    # ---------- PUL ISHLASH INFO + SHARE ----------
     if data == "money_info":
         bot_username = (await context.bot.get_me()).username
         referral_link = await get_referral_link(user_id, bot_username)
@@ -541,8 +599,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔗 **Sizning referal havolangiz:**\n`{referral_link}`\n\n"
             f"⚠️ Doʻstingiz botga start bosganida bonus avtomatik hisoblanadi."
         )
-
-        # 📤 Share tugmasi uchun maxsus xabar va havola
         share_text = (
             f"🤖 Futbol tahlillari va pul ishlash botiga taklif!\n\n"
             f"Bot orqali top-5 chempionat oʻyinlarini kuzating, tahlillarni oling va "
@@ -552,7 +608,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         from urllib.parse import quote
         share_url = f"https://t.me/share/url?url={quote(referral_link)}&text={quote(share_text)}"
-
         keyboard = [
             [InlineKeyboardButton("📤 Do'stlarga yuborish", url=share_url)],
             [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
@@ -562,7 +617,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
         return
 
-    # ---------- BALANS KO'RISH ----------
+    # ---------- BALANS ----------
     if data == "balance_info":
         balance = await get_user_balance(user_id)
         stats = await get_referral_stats(user_id)
@@ -642,7 +697,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_leagues_keyboard())
         return
 
-    # ---------- FUTBOL QISMI (LIGALAR, OʻYINLAR, KUZATISH) ----------
+    # ---------- FUTBOL QISMI ----------
     if data == "leagues":
         await query.edit_message_text(
             "sport uchun eng yuqori sifatdagi taxlilarni olish uchun Quyidagi chempionatlardan birini tanlang:",
@@ -826,19 +881,13 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
     except:
         await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
         return
-
-    # Tahlilni saqlash (yangi yoki yangilash)
     await add_analysis(match_id, analysis, user.id)
     await update.message.reply_text(f"✅ Tahlil qoʻshildi (Match ID: {match_id}).")
-
-    # ------------------- BILDIRISHNOMA QISMI -------------------
-    # Shu o‘yinga obuna bo‘lgan foydalanuvchilarni olish
     subscribers = await get_subscribers_for_match(match_id)
     if subscribers:
         sent_count = 0
         for uid in subscribers:
             try:
-                # Adminning o‘ziga ham yuboriladi (agar obuna bo‘lsa) – bu istalgan holat
                 await context.bot.send_message(
                     uid,
                     f"📝 **Oʻyin tahlili yangilandi!**\n\n"
@@ -854,7 +903,6 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
             except Exception as e:
                 logger.error(f"Tahlil bildirishnomasini yuborib boʻlmadi (user {uid}): {e}")
         await update.message.reply_text(f"📢 {sent_count} ta obunachiga bildirishnoma yuborildi.")
-    # ------------------------------------------------------------
 
 async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -958,7 +1006,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul + Share + Bildirishnoma)")
+    return web.Response(text="✅ Bot ishlamoqda (Futbol + Pul + Share + Bonus)")
 
 async def run_web_server():
     app = web.Application()
@@ -991,7 +1039,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul + Share + Bildirishnoma)")
+    logger.info("🤖 Bot ishga tushdi! (Futbol + Pul + Share + Bonus)")
     asyncio.create_task(notification_scheduler(application))
     while True:
         await asyncio.sleep(3600)
