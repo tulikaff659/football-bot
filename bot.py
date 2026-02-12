@@ -29,16 +29,39 @@ TOP_LEAGUES = {
     "FL1": {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
 }
 
-# Necha kun ichidagi o'yinlar (7 kun)
+# Ishonchli futbol saytlari (liga va jamoa bo‘yicha havola generatorlari)
+TRUSTED_SITES = {
+    "PL": {
+        "base": "https://www.espn.com/soccer/match/_/gameId/{}",
+        "bbc": "https://www.bbc.com/sport/football/{}",
+        "sky": "https://www.skysports.com/football/{}-vs-{}/{}"
+    },
+    "PD": {
+        "base": "https://www.marca.com/futbol/{}",
+        "as": "https://as.com/futbol/{}.html"
+    },
+    "SA": {
+        "base": "https://www.gazzetta.it/calcio/{}",
+        "corriere": "https://www.corriere.it/calcio/{}"
+    },
+    "BL1": {
+        "base": "https://www.kicker.de/{}/aufstellung",
+        "bild": "https://www.bild.de/sport/fussball/{}.html"
+    },
+    "FL1": {
+        "base": "https://www.lequipe.fr/Football/match/{}",
+        "rmc": "https://rmcsport.bfmtv.com/football/{}"
+    }
+}
+
+# Necha kun ichidagi o'yinlar
 DAYS_AHEAD = 7
 DB_PATH = "data/bot.db"
 
 # ========== MAʼLUMOTLAR BAZASI ==========
 async def init_db():
-    """Bazani ishga tushirish – jadvallarni yaratish"""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-        # Adminlar jadvali
         await db.execute('''
             CREATE TABLE IF NOT EXISTS admins (
                 user_id INTEGER PRIMARY KEY,
@@ -46,7 +69,6 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Tahlillar jadvali
         await db.execute('''
             CREATE TABLE IF NOT EXISTS match_analyses (
                 match_id INTEGER PRIMARY KEY,
@@ -55,7 +77,6 @@ async def init_db():
                 added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        # Obunalar jadvali
         await db.execute('''
             CREATE TABLE IF NOT EXISTS subscriptions (
                 user_id INTEGER,
@@ -63,6 +84,7 @@ async def init_db():
                 match_time TIMESTAMP NOT NULL,
                 home_team TEXT,
                 away_team TEXT,
+                league_code TEXT,
                 notified_1h BOOLEAN DEFAULT 0,
                 notified_15m BOOLEAN DEFAULT 0,
                 notified_lineups BOOLEAN DEFAULT 0,
@@ -72,7 +94,6 @@ async def init_db():
         ''')
         await db.commit()
 
-    # Asosiy adminni qo'shish (agar mavjud bo'lmasa)
     MAIN_ADMIN = 6935090105
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
@@ -81,13 +102,11 @@ async def init_db():
                 await db.commit()
                 logger.info(f"Asosiy admin qo'shildi: {MAIN_ADMIN}")
 
-# ---------- Admin tekshirish ----------
 async def is_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,)) as cursor:
             return await cursor.fetchone() is not None
 
-# ---------- Admin qo'shish ----------
 async def add_admin(user_id: int, added_by: int) -> bool:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -97,20 +116,17 @@ async def add_admin(user_id: int, added_by: int) -> bool:
     except:
         return False
 
-# ---------- Admin o'chirish ----------
 async def remove_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
         await db.commit()
         return True
 
-# ---------- Adminlar ro'yxati ----------
 async def get_all_admins():
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT user_id, added_by, added_at FROM admins ORDER BY added_at') as cursor:
             return await cursor.fetchall()
 
-# ---------- Tahlil qo'shish/yangilash ----------
 async def add_analysis(match_id: int, analysis: str, added_by: int):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
@@ -123,20 +139,19 @@ async def add_analysis(match_id: int, analysis: str, added_by: int):
         ''', (match_id, analysis, added_by))
         await db.commit()
 
-# ---------- Tahlil olish ----------
 async def get_analysis(match_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute('SELECT analysis, added_at FROM match_analyses WHERE match_id = ?', (match_id,)) as cursor:
             return await cursor.fetchone()
 
 # ========== OBUNA TIZIMI ==========
-async def subscribe_user(user_id: int, match_id: int, match_time: str, home: str, away: str):
+async def subscribe_user(user_id: int, match_id: int, match_time: str, home: str, away: str, league_code: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute('''
             INSERT OR REPLACE INTO subscriptions 
-            (user_id, match_id, match_time, home_team, away_team, notified_1h, notified_15m, notified_lineups)
-            VALUES (?, ?, ?, ?, ?, 0, 0, 0)
-        ''', (user_id, match_id, match_time, home, away))
+            (user_id, match_id, match_time, home_team, away_team, league_code, notified_1h, notified_15m, notified_lineups)
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
+        ''', (user_id, match_id, match_time, home, away, league_code))
         await db.commit()
 
 async def unsubscribe_user(user_id: int, match_id: int):
@@ -146,7 +161,11 @@ async def unsubscribe_user(user_id: int, match_id: int):
 
 async def get_all_subscriptions():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, match_id, match_time, home_team, away_team, notified_1h, notified_15m, notified_lineups FROM subscriptions') as cursor:
+        async with db.execute('''
+            SELECT user_id, match_id, match_time, home_team, away_team, league_code, 
+                   notified_1h, notified_15m, notified_lineups 
+            FROM subscriptions
+        ''') as cursor:
             return await cursor.fetchall()
 
 async def update_notification_flags(user_id: int, match_id: int, one_hour: bool = False, fifteen_min: bool = False, lineups: bool = False):
@@ -168,7 +187,6 @@ async def update_notification_flags(user_id: int, match_id: int, one_hour: bool 
 
 # ========== API CALLS ==========
 async def fetch_matches_by_league(league_code: str):
-    """Liga bo'yicha o'yinlar ro'yxatini olish"""
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
     today = datetime.now().strftime("%Y-%m-%d")
@@ -192,7 +210,6 @@ async def fetch_matches_by_league(league_code: str):
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
 async def fetch_match_by_id(match_id: int):
-    """Bitta o'yin ma'lumotini olish"""
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
     try:
@@ -200,23 +217,125 @@ async def fetch_match_by_id(match_id: int):
             async with session.get(f"{FOOTBALL_DATA_URL}/matches/{match_id}", headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return {"success": data}  # ✅ data = o'yin obyekti (to'g'ri)
+                    return {"success": data}
                 else:
                     return {"error": f"❌ API xatolik: {resp.status}"}
     except Exception as e:
         logger.exception("Ulanish xatosi")
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
+# ========== TARKIBLARNI OLISH VA FORMATLASH ==========
+async def fetch_match_lineups(match_id: int):
+    result = await fetch_match_by_id(match_id)
+    if "error" in result:
+        return None
+    match = result["success"]
+    home_lineup = match.get("homeTeam", {}).get("lineup", [])
+    away_lineup = match.get("awayTeam", {}).get("lineup", [])
+    return {
+        "home_team": match.get("homeTeam", {}).get("name", "Noma'lum"),
+        "away_team": match.get("awayTeam", {}).get("name", "Noma'lum"),
+        "home_lineup": home_lineup,
+        "away_lineup": away_lineup,
+        "home_coach": match.get("homeTeam", {}).get("coach", {}).get("name") if match.get("homeTeam", {}).get("coach") else None,
+        "away_coach": match.get("awayTeam", {}).get("coach", {}).get("name") if match.get("awayTeam", {}).get("coach") else None,
+        "home_formation": match.get("homeTeam", {}).get("formation"),
+        "away_formation": match.get("awayTeam", {}).get("formation"),
+        "venue": match.get("venue"),
+        "attendance": match.get("attendance")
+    }
+
+def format_lineups_message(lineups_data):
+    if not lineups_data:
+        return "📋 Tarkiblar hali e'lon qilinmagan."
+    msg = f"⚽ **{lineups_data['home_team']} vs {lineups_data['away_team']}**\n\n"
+    if lineups_data.get('venue'):
+        msg += f"🏟️ Stadion: {lineups_data['venue']}\n"
+    if lineups_data.get('attendance'):
+        msg += f"👥 Tomoshabin: {lineups_data['attendance']}\n"
+    msg += "\n"
+    msg += f"🏠 **{lineups_data['home_team']}**"
+    if lineups_data.get('home_formation'):
+        msg += f" ({lineups_data['home_formation']})"
+    if lineups_data.get('home_coach'):
+        msg += f" – Murabbiy: {lineups_data['home_coach']}"
+    msg += "\n" + "━" * 30 + "\n"
+    if lineups_data['home_lineup']:
+        for player in lineups_data['home_lineup'][:11]:
+            name = player.get('name', 'Noma\'lum')
+            position = player.get('position', '')
+            shirt = player.get('shirtNumber', '')
+            position_icon = "🥅" if "Goalkeeper" in position else "🛡️" if "Defender" in position else "⚡" if "Midfielder" in position else "🎯"
+            msg += f"{position_icon} {shirt} – {name} ({position})\n"
+    else:
+        msg += "❌ Tarkib e'lon qilinmagan\n"
+    msg += "\n"
+    msg += f"🛣️ **{lineups_data['away_team']}**"
+    if lineups_data.get('away_formation'):
+        msg += f" ({lineups_data['away_formation']})"
+    if lineups_data.get('away_coach'):
+        msg += f" – Murabbiy: {lineups_data['away_coach']}"
+    msg += "\n" + "━" * 30 + "\n"
+    if lineups_data['away_lineup']:
+        for player in lineups_data['away_lineup'][:11]:
+            name = player.get('name', 'Noma\'lum')
+            position = player.get('position', '')
+            shirt = player.get('shirtNumber', '')
+            position_icon = "🥅" if "Goalkeeper" in position else "🛡️" if "Defender" in position else "⚡" if "Midfielder" in position else "🎯"
+            msg += f"{position_icon} {shirt} – {name} ({position})\n"
+    else:
+        msg += "❌ Tarkib e'lon qilinmagan\n"
+    return msg
+
+def generate_match_links(match_id: int, home_team: str, away_team: str, league_code: str):
+    links = []
+    espn_url = f"https://www.espn.com/soccer/match/_/gameId/{match_id}"
+    links.append(("📺 ESPN", espn_url))
+    if league_code == "PL":
+        bbc_url = f"https://www.bbc.com/sport/football/{match_id}"
+        links.append(("📰 BBC Sport", bbc_url))
+    sky_url = f"https://www.skysports.com/football/{home_team.lower().replace(' ', '-')}-vs-{away_team.lower().replace(' ', '-')}/{match_id}"
+    links.append(("⚡ Sky Sports", sky_url))
+    if league_code == "PD":
+        marca_url = f"https://www.marca.com/futbol/primera-division/{match_id}.html"
+        as_url = f"https://as.com/futbol/primera/{match_id}.html"
+        links.append(("📘 MARCA", marca_url))
+        links.append(("📙 AS", as_url))
+    elif league_code == "SA":
+        gazzetta_url = f"https://www.gazzetta.it/calcio/serie-a/match-{match_id}.shtml"
+        corriere_url = f"https://www.corriere.it/calcio/serie-a/{match_id}.shtml"
+        links.append(("📗 La Gazzetta", gazzetta_url))
+        links.append(("📕 Corriere", corriere_url))
+    elif league_code == "BL1":
+        kicker_url = f"https://www.kicker.de/{match_id}/aufstellung"
+        bild_url = f"https://www.bild.de/sport/fussball/bundesliga/{match_id}.html"
+        links.append(("📘 Kicker", kicker_url))
+        links.append(("📙 Bild", bild_url))
+    elif league_code == "FL1":
+        lequipe_url = f"https://www.lequipe.fr/Football/match/{match_id}"
+        rmc_url = f"https://rmcsport.bfmtv.com/football/match-{match_id}.html"
+        links.append(("📗 L'Equipe", lequipe_url))
+        links.append(("📕 RMC Sport", rmc_url))
+    flashscore_url = f"https://www.flashscore.com/match/{match_id}/#/lineups"
+    links.append(("⚽ FlashScore", flashscore_url))
+    sofascore_url = f"https://www.sofascore.com/football/match/{match_id}"
+    links.append(("📊 SofaScore", sofascore_url))
+    return links
+
+def format_links_message(links):
+    msg = "🔗 **Ishonchli saytlarda tarkiblarni ko‘ring:**\n\n"
+    for name, url in links[:5]:
+        msg += f"• [{name}]({url})\n"
+    return msg
+
 # ========== INLINE TUGMALAR ==========
 def get_leagues_keyboard():
-    """Ligalar ro'yxati tugmalari"""
     keyboard = []
     for code, data in TOP_LEAGUES.items():
         keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{code}")])
     return InlineKeyboardMarkup(keyboard)
 
 def build_matches_keyboard(matches):
-    """Oʻyinlar roʻyxati tugmalari (faqat o'yin nomlari)"""
     keyboard = []
     for match in matches[:10]:
         home = match["homeTeam"]["name"]
@@ -225,22 +344,36 @@ def build_matches_keyboard(matches):
         tashkent_time = match_date + timedelta(hours=5)
         date_str = tashkent_time.strftime("%d.%m %H:%M")
         match_id = match["id"]
-
         button_text = f"{home} – {away} ({date_str})"
         callback_data = f"match_{match_id}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    
     keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
     return InlineKeyboardMarkup(keyboard)
 
-def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False):
-    """Oʻyin tahlili sahifasidagi tugmalar (Kuzatish / Bekor qilish + Back)"""
+def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False, lineups_available: bool = False):
+    """Oʻyin tahlili sahifasidagi tugmalar"""
     keyboard = []
+    
+    # 1-qator: Kuzatish / Bekor qilish
     if is_subscribed:
         keyboard.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{match_id}")])
     else:
         keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
+    
+    # 2-qator: Qo'shimcha tashqi havolalar (YANGI)
+    keyboard.append([
+        InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
+        InlineKeyboardButton("📊 Chuqur tahlil", url="http://test.com"),
+        InlineKeyboardButton("🎲 Stavka qilish", url="http://test2.com")
+    ])
+    
+    # 3-qator: Tarkiblarni ko'rish (agar mavjud bo'lsa)
+    if lineups_available:
+        keyboard.append([InlineKeyboardButton("📋 Tarkiblarni ko‘rish", callback_data=f"lineups_{match_id}")])
+    
+    # 4-qator: Orqaga
     keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
+    
     return InlineKeyboardMarkup(keyboard)
 
 # ========== TELEGRAM HANDLERLAR ==========
@@ -298,6 +431,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("match_"):
         match_id = int(data.split("_")[1])
         analysis = await get_analysis(match_id)
+        
+        match_result = await fetch_match_by_id(match_id)
+        league_code = "PL"
+        home_team = "Noma'lum"
+        away_team = "Noma'lum"
+        if "success" in match_result:
+            match_data = match_result["success"]
+            competition = match_data.get("competition", {}).get("code", "")
+            if competition in TOP_LEAGUES:
+                league_code = competition
+            home_team = match_data.get("homeTeam", {}).get("name", "Noma'lum")
+            away_team = match_data.get("awayTeam", {}).get("name", "Noma'lum")
+        
         if analysis:
             text, added_at = analysis
             added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
@@ -308,100 +454,125 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if await is_admin(user_id):
                 msg += f"\n\n💡 Admin: `/addanalysis {match_id} <tahlil>`"
         
-        # Foydalanuvchi obuna bo'lganmi?
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute('SELECT 1 FROM subscriptions WHERE user_id = ? AND match_id = ?', (user_id, match_id)) as cursor:
                 is_subscribed = await cursor.fetchone() is not None
         
-        keyboard = build_match_detail_keyboard(match_id, is_subscribed)
+        lineups_data = await fetch_match_lineups(match_id)
+        lineups_available = lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup'])
+        
+        keyboard = build_match_detail_keyboard(match_id, is_subscribed, lineups_available)
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # ---------- Obuna bo'lish (TUZATILGAN) ----------
+    # ---------- Tarkiblarni ko'rish ----------
+    if data.startswith("lineups_"):
+        match_id = int(data.split("_")[1])
+        await query.edit_message_text("⏳ Tarkiblar yuklanmoqda...")
+        lineups_data = await fetch_match_lineups(match_id)
+        if lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup']):
+            msg = format_lineups_message(lineups_data)
+        else:
+            msg = "❌ Bu oʻyin uchun tarkiblar hali eʼlon qilinmagan."
+        
+        match_result = await fetch_match_by_id(match_id)
+        league_code = "PL"
+        home_team = "Noma'lum"
+        away_team = "Noma'lum"
+        if "success" in match_result:
+            match_data = match_result["success"]
+            competition = match_data.get("competition", {}).get("code", "")
+            if competition in TOP_LEAGUES:
+                league_code = competition
+            home_team = match_data.get("homeTeam", {}).get("name", "Noma'lum")
+            away_team = match_data.get("awayTeam", {}).get("name", "Noma'lum")
+        
+        links = generate_match_links(match_id, home_team, away_team, league_code)
+        msg += "\n\n" + format_links_message(links)
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")]
+        ])
+        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+        return
+
+    # ---------- Obuna bo'lish ----------
     if data.startswith("subscribe_"):
         match_id = int(data.split("_")[1])
-        
-        # API dan o'yin ma'lumotini olish
         result = await fetch_match_by_id(match_id)
         if "error" in result:
             await query.answer("❌ Xatolik yuz berdi", show_alert=True)
             return
-        
-        # ✅ MUHIM TUZATISH: match obyekti to'g'ridan-to'g'ri
         match = result["success"]
-        home = match["homeTeam"]["name"]      # to'g'ri
-        away = match["awayTeam"]["name"]      # to'g'ri
-        match_time = match["utcDate"]         # to'g'ri
-
-        # Bazaga obunani yozish
-        await subscribe_user(user_id, match_id, match_time, home, away)
-
-        # Tugmalarni yangilash (holatni o'zgartirish)
+        home = match["homeTeam"]["name"]
+        away = match["awayTeam"]["name"]
+        match_time = match["utcDate"]
+        competition = match.get("competition", {}).get("code", "")
+        league_code = competition if competition in TOP_LEAGUES else "PL"
+        await subscribe_user(user_id, match_id, match_time, home, away, league_code)
         new_keyboard = build_match_detail_keyboard(match_id, is_subscribed=True)
         await query.edit_message_reply_markup(reply_markup=new_keyboard)
-
-        # Qisqa bildirishnoma (popup)
-        await query.answer("✅ Kuzatish boshlandi!", show_alert=False)
+        await query.answer("✅ Kuzatish boshlandi! Tarkiblar va eslatmalarni olasiz.", show_alert=False)
         return
 
     # ---------- Obunani bekor qilish ----------
     if data.startswith("unsubscribe_"):
         match_id = int(data.split("_")[1])
-        
-        # Bazadan obunani o'chirish
         await unsubscribe_user(user_id, match_id)
-
-        # Tugmalarni yangilash (holatni o'zgartirish)
         new_keyboard = build_match_detail_keyboard(match_id, is_subscribed=False)
         await query.edit_message_reply_markup(reply_markup=new_keyboard)
-
-        # Qisqa bildirishnoma
         await query.answer("❌ Kuzatish bekor qilindi", show_alert=False)
         return
 
 # ========== NOTIFIKATSIYA SCHEDULERI ==========
 async def notification_scheduler(app: Application):
-    """Har daqiqa ishlaydi, obuna boʻlgan oʻyinlar uchun eslatma yuboradi."""
     while True:
         try:
             now = datetime.utcnow()
             subscriptions = await get_all_subscriptions()
             for sub in subscriptions:
-                user_id, match_id, match_time_str, home, away, notified_1h, notified_15m, notified_lineups = sub
+                user_id, match_id, match_time_str, home, away, league_code, notified_1h, notified_15m, notified_lineups = sub
                 match_time = datetime.strptime(match_time_str, "%Y-%m-%dT%H:%M:%SZ")
                 delta = match_time - now
                 minutes_left = delta.total_seconds() / 60
 
-                # 1 soat qolganda (55-65 daqiqa oralig'i)
                 if not notified_1h and 55 <= minutes_left <= 65:
                     await app.bot.send_message(
                         user_id,
-                        f"⏰ **1 soat qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC\n\nTarkib eʼlon qilinishi kutilmoqda.",
+                        f"⏰ **1 soat qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC+0\n\n📋 Tarkiblar eʼlon qilinishi kutilmoqda.",
                         parse_mode="Markdown"
                     )
-                    await update_notification_flags(user_id, match_id, one_hour=True)
-                    # Tarkib eʼloni simulyatsiyasi
                     if not notified_lineups:
-                        await app.bot.send_message(
-                            user_id,
-                            f"📋 **Asosiy tarkib eʼlon qilindi!**\n\n{home} – {away}\n[Bu yerda haqiqiy tarkib boʻlishi mumkin]",
-                            parse_mode="Markdown"
-                        )
+                        lineups_data = await fetch_match_lineups(match_id)
+                        if lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup']):
+                            lineup_msg = format_lineups_message(lineups_data)
+                            await app.bot.send_message(user_id, lineup_msg, parse_mode="Markdown")
+                            links = generate_match_links(match_id, home, away, league_code)
+                            links_msg = format_links_message(links)
+                            await app.bot.send_message(user_id, links_msg, parse_mode="Markdown", disable_web_page_preview=True)
+                        else:
+                            links = generate_match_links(match_id, home, away, league_code)
+                            msg = f"📋 **{home} – {away}**\n\n"
+                            msg += "❌ Tarkiblar API orqali e'lon qilinmagan.\n"
+                            msg += "🔗 Quyidagi ishonchli saytlarda tarkiblarni ko‘ring:\n\n"
+                            for name, url in links[:4]:
+                                msg += f"• [{name}]({url})\n"
+                            await app.bot.send_message(user_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
                         await update_notification_flags(user_id, match_id, lineups=True)
+                    await update_notification_flags(user_id, match_id, one_hour=True)
 
-                # 15 daqiqa qolganda (10-20 daqiqa oralig'i)
                 if not notified_15m and 10 <= minutes_left <= 20:
-                    await app.bot.send_message(
-                        user_id,
-                        f"⏳ **15 daqiqa qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC",
-                        parse_mode="Markdown"
-                    )
+                    links = generate_match_links(match_id, home, away, league_code)
+                    msg = f"⏳ **15 daqiqa qoldi!**\n\n{home} – {away}\n🕒 {match_time.strftime('%d.%m.%Y %H:%M')} UTC+0\n\n"
+                    msg += "🔗 Jonli tarkiblar va statistika:\n\n"
+                    for name, url in links[:5]:
+                        msg += f"• [{name}]({url})\n"
+                    await app.bot.send_message(user_id, msg, parse_mode="Markdown", disable_web_page_preview=True)
                     await update_notification_flags(user_id, match_id, fifteen_min=True)
 
         except Exception as e:
-            logger.exception("Notification scheduler error")
-
-        await asyncio.sleep(60)  # har daqiqa tekshiradi
+            logger.exception(f"Notification scheduler error: {e}")
+        await asyncio.sleep(60)
 
 # ========== ADMIN BUYRUQLARI ==========
 async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -477,7 +648,7 @@ async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         text += f"• `{aid}` – qo'shdi: `{added_by}`, {added_at_dt.strftime('%d.%m.%Y')}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ========== TEST / DEBUG BUYRUQLARI ==========
+# ========== TEST / DEBUG ==========
 async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not FOOTBALL_DATA_KEY:
         await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
@@ -496,9 +667,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_leagues_keyboard()
     )
 
-# ========== WEB SERVER (RAILWAY UCHUN) ==========
+# ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Kuzatish tugmasi toʻliq tuzatilgan)")
+    return web.Response(text="✅ Bot ishlamoqda (Qoʻshimcha tugmalar bilan)")
 
 async def run_web_server():
     app = web.Application()
@@ -517,12 +688,9 @@ async def run_bot():
         logger.error("BOT_TOKEN topilmadi!")
         return
 
-    # Bazani ishga tushirish
     await init_db()
-
     application = Application.builder().token(token).build()
 
-    # Handlerlar
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_api))
     application.add_handler(CommandHandler("debug", debug))
@@ -536,9 +704,8 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Kuzatish tugmasi toʻliq tuzatilgan)")
+    logger.info("🤖 Bot ishga tushdi! (Qoʻshimcha tugmalar qoʻshildi)")
 
-    # Notifikatsiya schedulerini ishga tushirish
     asyncio.create_task(notification_scheduler(application))
 
     while True:
