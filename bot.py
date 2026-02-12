@@ -14,101 +14,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ========== API KALITI TOʻGʻRIDAN-TOʻGʻRI KOD ICHIDA ==========
-API_KEY = "d1de28fade2e0d5ec98b956b46858df7"   # Sizning dashboard kalitingiz
-API_HOST = "v3.football.api-sports.io"
+# ========== FOOTBALL-DATA.ORG SOZLAMALARI ==========
+FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY")  # Emailda kelgan kalit
+FOOTBALL_DATA_HOST = "api.football-data.org"
+FOOTBALL_DATA_URL = "https://api.football-data.org/v4/matches"
 
-# Top 5 chempionat (ID, nom)
+# Top 5 chempionat kodlari (Football-Data.org bo'yicha)
 TOP_LEAGUES = {
-    39: {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
-    140: {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
-    135: {"name": "🇮🇹 Seriya A", "country": "Italiya"},
-    78: {"name": "🇩🇪 Bundesliga", "country": "Germaniya"},
-    61: {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
+    "PL": {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
+    "PD": {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
+    "SA": {"name": "🇮🇹 Seriya A", "country": "Italiya"},
+    "BL1": {"name": "🇩🇪 Bundesliga", "country": "Germaniya"},
+    "FL1": {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
 }
 
-def get_current_season():
-    """2025/2026 mavsumi uchun 2025 qaytaradi"""
-    now = datetime.now()
-    return now.year if now.month >= 8 else now.year - 1
+# Necha kun ichidagi o'yinlar (4 kun qilib belgilangan)
+DAYS_AHEAD = 4
 
 # ---------- INLINE TUGMALAR ----------
 def get_leagues_keyboard():
     keyboard = []
-    for lid, data in TOP_LEAGUES.items():
-        keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{lid}")])
+    for league_code, data in TOP_LEAGUES.items():
+        keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{league_code}")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- STATIK MAʼLUMOT (API BOʻSH BOʻLSA) ----------
-def get_static_matches(league_name):
-    now = datetime.now()
-    today = now.strftime("%d.%m")
-    tomorrow = (now + timedelta(days=1)).strftime("%d.%m")
-    day3 = (now + timedelta(days=2)).strftime("%d.%m")
+# ---------- FOOTBALL-DATA.ORG ORQALI OʻYINLARNI OLISH ----------
+async def fetch_matches_by_league(league_code: str):
+    """Berilgan liga kodi bo'yicha 4 kun ichidagi o'yinlarni olish"""
+    if not FOOTBALL_DATA_KEY:
+        return {"error": "❌ FOOTBALL_DATA_KEY muhit oʻzgaruvchisida topilmadi!"}
     
-    if "Premyer" in league_name:
-        return [
-            {"home": "Manchester City", "away": "Arsenal", "time": f"{today} 19:45"},
-            {"home": "Liverpool", "away": "Chelsea", "time": f"{tomorrow} 21:00"},
-            {"home": "Manchester United", "away": "Tottenham", "time": f"{day3} 18:30"}
-        ]
-    elif "La Liga" in league_name:
-        return [
-            {"home": "Real Madrid", "away": "Barcelona", "time": f"{tomorrow} 21:00"},
-            {"home": "Atletico Madrid", "away": "Sevilla", "time": f"{today} 20:00"}
-        ]
-    elif "Seriya A" in league_name:
-        return [
-            {"home": "Inter", "away": "Juventus", "time": f"{tomorrow} 20:45"},
-            {"home": "Milan", "away": "Napoli", "time": f"{today} 19:30"}
-        ]
-    elif "Bundesliga" in league_name:
-        return [
-            {"home": "Bayern Munich", "away": "Dortmund", "time": f"{tomorrow} 19:30"},
-            {"home": "RB Leipzig", "away": "Bayer Leverkusen", "time": f"{today} 18:00"}
-        ]
-    elif "Liga 1" in league_name:
-        return [
-            {"home": "PSG", "away": "Marseille", "time": f"{tomorrow} 21:45"},
-            {"home": "Lyon", "away": "Monaco", "time": f"{today} 19:00"}
-        ]
-    else:
-        return [
-            {"home": "Manchester City", "away": "Liverpool", "time": f"{today} 19:45"},
-            {"home": "Real Madrid", "away": "Barcelona", "time": f"{tomorrow} 21:00"}
-        ]
-
-# ---------- 7 KUN ICHIDAGI OʻYINLARNI OLISH ----------
-async def fetch_matches_by_league(league_id: int):
     today = datetime.now().strftime("%Y-%m-%d")
-    seven_days = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-    season = get_current_season()
+    end_date = (datetime.now() + timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
     
-    url = f"https://{API_HOST}/v3/fixtures"
-    headers = {"x-apisports-key": API_KEY}
+    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
     params = {
-        "league": league_id,
-        "season": season,
-        "from": today,
-        "to": seven_days,
-        "timezone": "Asia/Tashkent"
+        "competitions": league_code,
+        "dateFrom": today,
+        "dateTo": end_date,
+        "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"  # Barcha holatlar
     }
     
-    logger.info(f"Soʻrov: Liga {league_id}, mavsum {season}, dan {today} gacha {seven_days}")
+    logger.info(f"Soʻrov: Liga {league_code}, dan {today} gacha {end_date}")
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params) as resp:
+            async with session.get(
+                FOOTBALL_DATA_URL, 
+                headers=headers, 
+                params=params
+            ) as resp:
                 logger.info(f"HTTP javob: {resp.status}")
                 
                 if resp.status == 200:
                     data = await resp.json()
-                    matches = data.get("response", [])
+                    matches = data.get("matches", [])
                     logger.info(f"Oʻyinlar soni: {len(matches)}")
-                    
-                    if len(matches) == 0:
-                        return {"success": [], "use_static": True}
-                    return {"success": matches, "use_static": False}
+                    return {"success": matches}
+                elif resp.status == 401:
+                    return {"error": "❌ API kaliti notoʻgʻri. Football-Data.org dan yangi kalit oling."}
+                elif resp.status == 429:
+                    return {"error": "❌ Soʻrovlar limiti oshib ketdi. Bir daqiqa kuting."}
                 else:
                     return {"error": f"❌ API xatolik: HTTP {resp.status}"}
     except Exception as e:
@@ -116,50 +82,41 @@ async def fetch_matches_by_league(league_id: int):
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
 # ---------- OʻYINLARNI FORMATLASH ----------
-def format_matches(matches, league_name, use_static=False):
-    # Agar API boʻsh boʻlsa, statik maʼlumotni ishlatamiz
-    if (not matches or len(matches) == 0) and use_static:
-        static = get_static_matches(league_name)
-        text = f"🏆 **{league_name}** (namuna maʼlumot)\n"
-        text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – keyingi 7 kun\n"
-        text += "━" * 35 + "\n"
-        for m in static:
-            text += f"• {m['home']} – {m['away']}  ⏳ {m['time']}\n"
-        text += "\n⚠️ *API real vaqt maʼlumot bermadi, namuna koʻrsatilmoqda*"
-        return text
-    
+def format_matches(matches, league_name):
     if not matches:
-        return f"⚽ {league_name}\n7 kun ichida oʻyinlar yoʻq."
+        return f"⚽ {league_name}\n{DAYS_AHEAD} kun ichida oʻyinlar yoʻq."
     
     text = f"🏆 **{league_name}**\n"
-    text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – keyingi 7 kun\n"
+    text += f"📅 {datetime.now().strftime('%d.%m.%Y')} – keyingi {DAYS_AHEAD} kun\n"
     text += "━" * 35 + "\n"
     
-    for match in matches[:10]:
-        fixture = match["fixture"]
-        teams = match["teams"]
-        goals = match["goals"]
-        status = fixture["status"]["short"]
-        match_date = fixture["date"][:10]
-        match_time = fixture["date"][11:16]
+    for match in matches:
+        home = match["homeTeam"]["name"]
+        away = match["awayTeam"]["name"]
+        match_date = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
+        tashkent_time = match_date + timedelta(hours=5)  # UTC+5 (Toshkent)
+        date_str = tashkent_time.strftime("%d.%m %H:%M")
+        status = match["status"]
         
-        date_obj = datetime.strptime(match_date, "%Y-%m-%d")
-        date_str = date_obj.strftime("%d.%m")
-        
-        if status == "LIVE":
-            status_icon = "🟢"
-            score = f"{goals['home']}:{goals['away']}"
-        elif status == "HT":
-            status_icon = "🟡"
-            score = f"{goals['home']}:{goals['away']}"
-        elif status == "FT":
+        # Statusga qarab ikonka va hisob
+        if status == "FINISHED":
             status_icon = "✅"
-            score = f"**{goals['home']}:{goals['away']}**"
-        else:
+            score_home = match["score"]["fullTime"]["home"]
+            score_away = match["score"]["fullTime"]["away"]
+            if score_home is None or score_away is None:
+                score = f"⏳ {date_str}"
+            else:
+                score = f"**{score_home}:{score_away}**"
+        elif status in ["LIVE", "IN_PLAY", "PAUSED"]:
+            status_icon = "🟢"
+            score_home = match["score"]["fullTime"]["home"] or match["score"]["halfTime"]["home"] or 0
+            score_away = match["score"]["fullTime"]["away"] or match["score"]["halfTime"]["away"] or 0
+            score = f"{score_home}:{score_away}"
+        else:  # SCHEDULED, TIMED
             status_icon = "⏳"
-            score = f"{date_str} {match_time}"
+            score = date_str
         
-        text += f"• {teams['home']['name']} – {teams['away']['name']}  {score}  {status_icon}\n"
+        text += f"• {home} – {away}  {score}  {status_icon}\n"
     
     return text
 
@@ -168,7 +125,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"👋 Assalomu alaykum, {user.first_name}!\n"
-        "Quyidagi chempionatlardan birini tanlang – 7 kun ichidagi oʻyinlar:",
+        f"Quyidagi chempionatlardan birini tanlang – {DAYS_AHEAD} kun ichidagi oʻyinlar:",
         reply_markup=get_leagues_keyboard()
     )
 
@@ -176,20 +133,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    league_id = int(query.data.split("_")[1])
-    league_info = TOP_LEAGUES[league_id]
+    league_code = query.data.split("_")[1]  # "league_PL" -> "PL"
+    league_info = TOP_LEAGUES[league_code]
     
     await query.edit_message_text(f"⏳ {league_info['name']} – oʻyinlar yuklanmoqda...")
-    result = await fetch_matches_by_league(league_id)
+    result = await fetch_matches_by_league(league_code)
     
     if "error" in result:
         text = result["error"]
     else:
-        text = format_matches(
-            result.get("success", []), 
-            league_info['name'],
-            result.get("use_static", False)
-        )
+        text = format_matches(result["success"], league_info['name'])
     
     await query.edit_message_text(
         text,
@@ -198,20 +151,21 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """API javobini toʻliq koʻrsatadi"""
-    league_id = 39  # Angliya
-    today = datetime.now().strftime("%Y-%m-%d")
-    seven_days = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
-    season = get_current_season()
+    """API javobini toʻliq koʻrsatadi (Premyer Liga misolida)"""
+    if not FOOTBALL_DATA_KEY:
+        await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
+        return
     
-    url = f"https://{API_HOST}/v3/fixtures"
-    headers = {"x-apisports-key": API_KEY}
+    league_code = "PL"
+    today = datetime.now().strftime("%Y-%m-%d")
+    end_date = (datetime.now() + timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
+    
+    url = FOOTBALL_DATA_URL
+    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
     params = {
-        "league": league_id,
-        "season": season,
-        "from": today,
-        "to": seven_days,
-        "timezone": "Asia/Tashkent"
+        "competitions": league_code,
+        "dateFrom": today,
+        "dateTo": end_date
     }
     
     msg = await update.message.reply_text("🔍 API soʻrovi yuborilmoqda...")
@@ -231,19 +185,18 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """API kaliti va ulanishni tekshiradi"""
-    url = f"https://{API_HOST}/v3/status"
-    headers = {"x-apisports-key": API_KEY}
+    if not FOOTBALL_DATA_KEY:
+        await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
+        return
+    
+    url = "https://api.football-data.org/v4/competitions/PL/matches?dateFrom=2026-02-01&dateTo=2026-02-28"
+    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
     
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers) as resp:
                 if resp.status == 200:
-                    data = await resp.json()
-                    await update.message.reply_text(
-                        f"✅ **API ulanishi muvaffaqiyatli!**\n"
-                        f"• Status: 200 OK\n"
-                        f"• Mavsum: {get_current_season()}"
-                    )
+                    await update.message.reply_text("✅ **API ulanishi muvaffaqiyatli!**")
                 else:
                     await update.message.reply_text(f"❌ API xatolik: {resp.status}")
     except Exception as e:
@@ -251,13 +204,13 @@ async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Quyidagi chempionatlardan birini tanlang:",
+        f"Quyidagi chempionatlardan birini tanlang – {DAYS_AHEAD} kun ichidagi oʻyinlar:",
         reply_markup=get_leagues_keyboard()
     )
 
 # ---------- WEB SERVER (Railway uchun) ----------
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda")
+    return web.Response(text="✅ Football-Data.org bot ishlamoqda")
 
 async def run_web_server():
     app = web.Application()
@@ -286,7 +239,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (API kalit kodga yozilgan, 7 kunlik oʻyinlar)")
+    logger.info("🤖 Bot ishga tushdi! (Football-Data.org, 4 kunlik oʻyinlar)")
     
     while True:
         await asyncio.sleep(3600)
