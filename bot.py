@@ -318,33 +318,54 @@ async def fetch_match_lineups(match_id: int):
         "attendance": match.get("attendance")
     }
 
+# ✅ TOʻGʻRILANGAN format_lineups – HECH QANDAY SYNTAX XATOSI YOʻQ
 def format_lineups(data):
     if not data or (not data['home_lineup'] and not data['away_lineup']):
         return "📋 Tarkiblar hali e'lon qilinmagan."
+    
     msg = f"⚽ **{data['home_team']} vs {data['away_team']}**\n\n"
-    if data['venue']: msg += f"🏟️ Stadion: {data['venue']}\n"
-    if data['attendance']: msg += f"👥 Tomoshabin: {data['attendance']}\n"
-    msg += "\n🏠 **" + data['home_team'] + "**"
-    if data['home_formation']: msg += f" ({data['home_formation']})"
-    if data['home_coach']: msg += f" – Murabbiy: {data['home_coach']}"
+    if data['venue']: 
+        msg += f"🏟️ Stadion: {data['venue']}\n"
+    if data['attendance']: 
+        msg += f"👥 Tomoshabin: {data['attendance']}\n"
+    
+    # Uy jamoasi
+    msg += f"\n🏠 **{data['home_team']}**"
+    if data['home_formation']: 
+        msg += f" ({data['home_formation']})"
+    if data['home_coach']: 
+        msg += f" – Murabbiy: {data['home_coach']}"
     msg += "\n" + "━" * 30 + "\n"
+    
     if data['home_lineup']:
         for p in data['home_lineup'][:11]:
             pos = p.get('position', '')
             icon = "🥅" if "Goalkeeper" in pos else "🛡️" if "Defender" in pos else "⚡" if "Midfielder" in pos else "🎯"
-            # F-STRING ICHIDA BACKSLASH YO'Q: double quote ishlatildi
-            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', "Noma'lum")} ({pos})\n"
-    else: msg += "❌ Tarkib e'lon qilinmagan\n"
-    msg += "\n🛣️ **" + data['away_team'] + "**"
-    if data['away_formation']: msg += f" ({data['away_formation']})"
-    if data['away_coach']: msg += f" – Murabbiy: {data['away_coach']}"
+            shirt = p.get('shirtNumber', '')
+            name = p.get('name', "Noma'lum")
+            # ✅ F-string toʻgʻri yozilgan
+            msg += f"{icon} {shirt} – {name} ({pos})\n"
+    else:
+        msg += "❌ Tarkib e'lon qilinmagan\n"
+    
+    # Mehmon jamoasi
+    msg += f"\n🛣️ **{data['away_team']}**"
+    if data['away_formation']: 
+        msg += f" ({data['away_formation']})"
+    if data['away_coach']: 
+        msg += f" – Murabbiy: {data['away_coach']}"
     msg += "\n" + "━" * 30 + "\n"
+    
     if data['away_lineup']:
         for p in data['away_lineup'][:11]:
             pos = p.get('position', '')
             icon = "🥅" if "Goalkeeper" in pos else "🛡️" if "Defender" in pos else "⚡" if "Midfielder" in pos else "🎯"
-            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', "Noma'lum")} ({pos})\n"
-    else: msg += "❌ Tarkib e'lon qilinmagan\n"
+            shirt = p.get('shirtNumber', '')
+            name = p.get('name', "Noma'lum")
+            msg += f"{icon} {shirt} – {name} ({pos})\n"
+    else:
+        msg += "❌ Tarkib e'lon qilinmagan\n"
+    
     return msg
 
 def generate_match_links(mid, home, away, league):
@@ -629,6 +650,7 @@ async def notification_scheduler(app: Application):
                 groups[mid]["users"].append({"id": uid, "n1": n1, "n15": n15, "nl": nl})
             for mid, g in groups.items():
                 delta = (g["time"] - datetime.utcnow()).total_seconds() / 60
+                # 1 soat
                 if not g["n1_flag"] and any(not u["n1"] for u in g["users"]):
                     if 55 <= delta <= 65:
                         for u in g["users"]:
@@ -641,6 +663,7 @@ async def notification_scheduler(app: Application):
                                 except Exception as e:
                                     logger.error(f"1h notification error: {e}")
                         g["n1_flag"] = True
+                        # Lineups
                         if not g["nl_flag"] and any(not u["nl"] for u in g["users"]):
                             lu = await fetch_match_lineups(mid)
                             if lu and (lu['home_lineup'] or lu['away_lineup']):
@@ -668,6 +691,7 @@ async def notification_scheduler(app: Application):
                                         except Exception as e:
                                             logger.error(f"Lineups notification error: {e}")
                             g["nl_flag"] = True
+                # 15 daqiqa
                 if not g["n15_flag"] and any(not u["n15"] for u in g["users"]):
                     if 10 <= delta <= 20:
                         links = generate_match_links(mid, g['home'], g['away'], g['league'])
@@ -756,12 +780,16 @@ async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     u = update.effective_user
     if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
     async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        users = (await db.execute_fetchall("SELECT COUNT(*) FROM users"))[0][0]
-        refs = (await db.execute_fetchall("SELECT COUNT(*) FROM referrals"))[0][0]
-        bal = (await db.execute_fetchall("SELECT SUM(balance) FROM users"))[0][0] or 0
-        wd_cnt = (await db.execute_fetchall("SELECT COUNT(*) FROM withdrawals WHERE status='completed'"))[0][0]
-        wd_sum = (await db.execute_fetchall("SELECT SUM(amount) FROM withdrawals WHERE status='completed'"))[0][0] or 0
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            users = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM referrals") as cur:
+            refs = (await cur.fetchone())[0]
+        async with db.execute("SELECT SUM(balance) FROM users") as cur:
+            bal = (await cur.fetchone())[0] or 0
+        async with db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='completed'") as cur:
+            wd_cnt = (await cur.fetchone())[0]
+        async with db.execute("SELECT SUM(amount) FROM withdrawals WHERE status='completed'") as cur:
+            wd_sum = (await cur.fetchone())[0] or 0
     text = f"📊 **Bot statistikasi**\n\n👥 Foydalanuvchilar: {users}\n🔗 Referallar: {refs}\n💰 Jami balans: {bal:,} soʻm\n💸 Yechimlar soni: {wd_cnt}\n💵 Jami yechilgan: {wd_sum:,} soʻm"
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -779,7 +807,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (F-string backslash fixed)")
+    return web.Response(text="✅ Bot ishlamoqda (Full fixed version)")
 
 async def run_web_server():
     app = web.Application()
@@ -811,7 +839,7 @@ async def run_bot():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (F-string backslash fixed)")
+    logger.info("🤖 Bot ishga tushdi! (Full fixed version)")
     asyncio.create_task(notification_scheduler(app))
     while True:
         await asyncio.sleep(3600)
