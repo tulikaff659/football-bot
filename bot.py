@@ -4,19 +4,17 @@ import logging
 import aiohttp
 import aiosqlite
 import random
+import time
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from urllib.parse import quote
+from collections import OrderedDict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
-from collections import OrderedDict
-import time
+from telegram.helpers import escape_markdown
 
 # ---------- SOZLAMALAR ----------
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ========== FOOTBALL-DATA.ORG ==========
@@ -24,37 +22,12 @@ FOOTBALL_DATA_KEY = os.environ.get("FOOTBALL_DATA_KEY")
 FOOTBALL_DATA_URL = "https://api.football-data.org/v4"
 HEADERS = {"X-Auth-Token": FOOTBALL_DATA_KEY}
 
-# Top 5 chempionat
 TOP_LEAGUES = {
     "PL": {"name": "🏴󠁧󠁢󠁥󠁮󠁧󠁿 Premyer Liga", "country": "Angliya"},
     "PD": {"name": "🇪🇸 La Liga", "country": "Ispaniya"},
     "SA": {"name": "🇮🇹 Seriya A", "country": "Italiya"},
     "BL1": {"name": "🇩🇪 Bundesliga", "country": "Germaniya"},
     "FL1": {"name": "🇫🇷 Liga 1", "country": "Fransiya"}
-}
-
-TRUSTED_SITES = {
-    "PL": {
-        "base": "https://www.espn.com/soccer/match/_/gameId/{}",
-        "bbc": "https://www.bbc.com/sport/football/{}",
-        "sky": "https://www.skysports.com/football/{}-vs-{}/{}"
-    },
-    "PD": {
-        "base": "https://www.marca.com/futbol/{}",
-        "as": "https://as.com/futbol/{}.html"
-    },
-    "SA": {
-        "base": "https://www.gazzetta.it/calcio/{}",
-        "corriere": "https://www.corriere.it/calcio/{}"
-    },
-    "BL1": {
-        "base": "https://www.kicker.de/{}/aufstellung",
-        "bild": "https://www.bild.de/sport/fussball/{}.html"
-    },
-    "FL1": {
-        "base": "https://www.lequipe.fr/Football/match/{}",
-        "rmc": "https://rmcsport.bfmtv.com/football/{}"
-    }
 }
 
 DAYS_AHEAD = 7
@@ -67,61 +40,46 @@ MAX_WITHDRAW_DAILY = 1
 AISPORTS_BONUS = 30000
 
 # ========== API RATE LIMIT ==========
-API_SEMAPHORE = asyncio.Semaphore(1)  # Bir vaqtda faqat 1 ta API call
+API_SEMAPHORE = asyncio.Semaphore(1)
 API_LAST_CALL = 0
-API_MIN_INTERVAL = 6  # 10 request/min -> har 6 sekundda 1 ta
+API_MIN_INTERVAL = 6
 
 async def rate_limited_api_call(url, headers, params=None):
-    """429 xatolarni avtomatik hal qiluvchi rate-limited API caller"""
     global API_LAST_CALL
     async with API_SEMAPHORE:
-        # So'nggi so'rovdan beri 6 sekund o'tganligini tekshirish
         now = time.time()
         if now - API_LAST_CALL < API_MIN_INTERVAL:
             await asyncio.sleep(API_MIN_INTERVAL - (now - API_LAST_CALL))
-        
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(3):
             try:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(url, headers=headers, params=params) as resp:
                         API_LAST_CALL = time.time()
                         if resp.status == 200:
-                            data = await resp.json()
-                            return {"success": data}
+                            return {"success": await resp.json()}
                         elif resp.status == 429:
-                            wait_time = 2 ** attempt + random.uniform(1, 3)
-                            logger.warning(f"429 xatosi, {wait_time:.1f} sekund kutish...")
-                            await asyncio.sleep(wait_time)
-                            continue
+                            await asyncio.sleep(2 ** attempt + random.uniform(1, 3))
                         else:
                             return {"error": f"❌ API xatolik: {resp.status}"}
             except Exception as e:
-                logger.exception(f"Ulanish xatosi (urinsh {attempt+1}): {e}")
-                if attempt == max_retries - 1:
-                    return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
+                logger.error(f"API call xatosi (urinish {attempt+1}): {e}")
                 await asyncio.sleep(2 ** attempt)
         return {"error": "❌ API ga bogʻlanib boʻlmadi"}
 
 # ========== MATCH CACHE (10 daqiqa) ==========
 match_cache = OrderedDict()
-CACHE_TTL = 600  # 10 daqiqa
+CACHE_TTL = 600
 
 async def get_cached_match(match_id: int):
-    """Match ma'lumotini keshdan olish, yo'q bo'lsa API dan so'rash"""
     now = time.time()
     if match_id in match_cache:
-        data, timestamp = match_cache[match_id]
-        if now - timestamp < CACHE_TTL:
+        data, ts = match_cache[match_id]
+        if now - ts < CACHE_TTL:
             return data
-        else:
-            del match_cache[match_id]
-    
-    # API dan olish
+        del match_cache[match_id]
     url = f"{FOOTBALL_DATA_URL}/matches/{match_id}"
     headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
     result = await rate_limited_api_call(url, headers)
-    
     if "success" in result:
         match_cache[match_id] = (result["success"], now)
         return result["success"]
@@ -131,144 +89,85 @@ async def get_cached_match(match_id: int):
 async def init_db():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY,
-                added_by INTEGER,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS match_analyses (
-                match_id INTEGER PRIMARY KEY,
-                analysis TEXT NOT NULL,
-                added_by INTEGER NOT NULL,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                user_id INTEGER,
-                match_id INTEGER,
-                match_time TIMESTAMP NOT NULL,
-                home_team TEXT,
-                away_team TEXT,
-                league_code TEXT,
-                notified_1h BOOLEAN DEFAULT 0,
-                notified_15m BOOLEAN DEFAULT 0,
-                notified_lineups BOOLEAN DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, match_id)
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                balance INTEGER DEFAULT 0,
-                referrer_id INTEGER,
-                referral_count INTEGER DEFAULT 0,
-                daily_withdraw_date TEXT,
-                aisports_bonus_received INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (referrer_id) REFERENCES users(user_id)
-            )
-        ''')
+        await db.execute("CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY, added_by INTEGER, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("CREATE TABLE IF NOT EXISTS match_analyses (match_id INTEGER PRIMARY KEY, analysis TEXT NOT NULL, added_by INTEGER NOT NULL, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        await db.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+            user_id INTEGER, match_id INTEGER, match_time TIMESTAMP NOT NULL, home_team TEXT, away_team TEXT, league_code TEXT,
+            notified_1h BOOLEAN DEFAULT 0, notified_15m BOOLEAN DEFAULT 0, notified_lineups BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, match_id))""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0, referrer_id INTEGER,
+            referral_count INTEGER DEFAULT 0, daily_withdraw_date TEXT, aisports_bonus_received INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY (referrer_id) REFERENCES users(user_id))""")
         try:
-            await db.execute('ALTER TABLE users ADD COLUMN aisports_bonus_received INTEGER DEFAULT 0')
+            await db.execute("ALTER TABLE users ADD COLUMN aisports_bonus_received INTEGER DEFAULT 0")
         except:
             pass
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS referrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                referrer_id INTEGER NOT NULL,
-                referred_id INTEGER NOT NULL,
-                bonus INTEGER DEFAULT 2000,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(referred_id)
-            )
-        ''')
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS withdrawals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                amount INTEGER NOT NULL,
-                status TEXT DEFAULT 'pending',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+        await db.execute("CREATE TABLE IF NOT EXISTS referrals (id INTEGER PRIMARY KEY AUTOINCREMENT, referrer_id INTEGER NOT NULL, referred_id INTEGER NOT NULL, bonus INTEGER DEFAULT 2000, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(referred_id))")
+        await db.execute("CREATE TABLE IF NOT EXISTS withdrawals (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, amount INTEGER NOT NULL, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
         await db.commit()
-    
     MAIN_ADMIN = 6935090105
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
-            if not await cursor.fetchone():
-                await db.execute('INSERT INTO admins (user_id, added_by) VALUES (?, ?)', (MAIN_ADMIN, MAIN_ADMIN))
+        async with db.execute("SELECT user_id FROM admins WHERE user_id = ?", (MAIN_ADMIN,)) as cur:
+            if not await cur.fetchone():
+                await db.execute("INSERT INTO admins (user_id, added_by) VALUES (?, ?)", (MAIN_ADMIN, MAIN_ADMIN))
                 await db.commit()
                 logger.info(f"Asosiy admin qo'shildi: {MAIN_ADMIN}")
 
 # ========== USER FUNCTIONS ==========
-async def send_referral_notification(referrer_id: int, referred_name: str, bonus: int, bot):
-    try:
-        await bot.send_message(
-            referrer_id,
-            f"🎉 **Tabriklaymiz!**\n\n"
-            f"Sizning taklif havolangiz orqali {referred_name} botga qoʻshildi.\n"
-            f"💰 Hisobingizga **{bonus:,} soʻm** bonus qoʻshildi!\n\n"
-            f"📊 Doʻstlaringizni koʻproq taklif qilib pul ishlang.",
-            parse_mode="Markdown"
-        )
-        logger.info(f"Referal bildirishnoma yuborildi: {referrer_id} <- {referred_name}")
-    except Exception as e:
-        logger.error(f"Referal bildirishnoma yuborilmadi ({referrer_id}): {e}")
-
-async def get_or_create_user(user_id: int, referrer_id: int = None, bot=None, referred_user_name: str = None):
+async def get_or_create_user(user_id: int, referrer_id: int = None, bot=None, referred_name=None):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            user = await cursor.fetchone()
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+            user = await cur.fetchone()
         if not user:
-            await db.execute('INSERT INTO users (user_id, referrer_id, aisports_bonus_received) VALUES (?, ?, 0)', (user_id, referrer_id))
+            await db.execute("INSERT INTO users (user_id, referrer_id, aisports_bonus_received) VALUES (?, ?, 0)", (user_id, referrer_id))
             await db.commit()
             if referrer_id and referrer_id != user_id:
-                async with db.execute('SELECT user_id FROM users WHERE user_id = ?', (referrer_id,)) as cursor:
-                    if await cursor.fetchone():
-                        await db.execute('UPDATE users SET balance = balance + ?, referral_count = referral_count + 1 WHERE user_id = ?', (REFERRAL_BONUS, referrer_id))
-                        await db.execute('INSERT OR IGNORE INTO referrals (referrer_id, referred_id, bonus) VALUES (?, ?, ?)', (referrer_id, user_id, REFERRAL_BONUS))
+                async with db.execute("SELECT user_id FROM users WHERE user_id = ?", (referrer_id,)) as cur:
+                    if await cur.fetchone():
+                        await db.execute("UPDATE users SET balance = balance + ?, referral_count = referral_count + 1 WHERE user_id = ?", (REFERRAL_BONUS, referrer_id))
+                        await db.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, bonus) VALUES (?, ?, ?)", (referrer_id, user_id, REFERRAL_BONUS))
                         await db.commit()
-                        logger.info(f"Referal bonus: {referrer_id} +{REFERRAL_BONUS} (yangi {user_id})")
-                        if bot and referred_user_name:
-                            asyncio.create_task(send_referral_notification(referrer_id, referred_user_name, REFERRAL_BONUS, bot))
-            async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as cursor:
-                user = await cursor.fetchone()
-        return user
+                        if bot and referred_name:
+                            asyncio.create_task(send_referral_notification(referrer_id, referred_name, REFERRAL_BONUS, bot))
+            async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+                user = await cur.fetchone()
+    return user
+
+async def send_referral_notification(referrer_id: int, referred_name: str, bonus: int, bot):
+    try:
+        await bot.send_message(referrer_id,
+            f"🎉 **Tabriklaymiz!**\n\nSizning taklif havolangiz orqali {referred_name} botga qoʻshildi.\n💰 Hisobingizga **{bonus:,} soʻm** bonus qoʻshildi!\n\n📊 Doʻstlaringizni koʻproq taklif qilib pul ishlang.",
+            parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Referal xabar yuborilmadi ({referrer_id}): {e}")
 
 async def get_user_balance(user_id: int) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT balance FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
             return row[0] if row else 0
 
-async def can_withdraw(user_id: int) -> tuple:
+async def can_withdraw(user_id: int):
     balance = await get_user_balance(user_id)
     if balance < MIN_WITHDRAW:
         return False, f"❌ Minimal yechish miqdori {MIN_WITHDRAW:,} soʻm. Sizda {balance:,} soʻm bor."
     today_str = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT daily_withdraw_date FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT daily_withdraw_date FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
             if row and row[0] == today_str:
                 return False, "❌ Bugun siz allaqachon pul yechib boʻlgansiz. Ertaga qayta urinib koʻring."
     return True, ""
 
 async def register_withdraw(user_id: int, amount: int) -> bool:
     can, msg = await can_withdraw(user_id)
-    if not can:
-        return False
-    if amount > await get_user_balance(user_id):
-        return False
+    if not can: return False
+    if amount > await get_user_balance(user_id): return False
     today_str = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('UPDATE users SET balance = balance - ?, daily_withdraw_date = ? WHERE user_id = ?', (amount, today_str, user_id))
-        await db.execute('INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, ?)', (user_id, amount, 'completed'))
+        await db.execute("UPDATE users SET balance = balance - ?, daily_withdraw_date = ? WHERE user_id = ?", (amount, today_str, user_id))
+        await db.execute("INSERT INTO withdrawals (user_id, amount, status) VALUES (?, ?, ?)", (user_id, amount, 'completed'))
         await db.commit()
     return True
 
@@ -277,57 +176,48 @@ async def get_referral_link(user_id: int, bot_username: str) -> str:
 
 async def get_referral_stats(user_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT referral_count FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            count = row[0] if row else 0
-        async with db.execute('SELECT SUM(bonus) FROM referrals WHERE referrer_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            total_bonus = row[0] if row[0] else 0
-        async with db.execute('SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND DATE(created_at) = DATE("now")', (user_id,)) as cursor:
-            row = await cursor.fetchone()
-            today_count = row[0] if row else 0
-    return {"count": count, "total_bonus": total_bonus, "today_count": today_count}
+        async with db.execute("SELECT referral_count FROM users WHERE user_id = ?", (user_id,)) as cur:
+            cnt = (await cur.fetchone())[0] or 0
+        async with db.execute("SELECT SUM(bonus) FROM referrals WHERE referrer_id = ?", (user_id,)) as cur:
+            total = (await cur.fetchone())[0] or 0
+        async with db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ? AND DATE(created_at) = DATE('now')", (user_id,)) as cur:
+            today = (await cur.fetchone())[0] or 0
+        return {"count": cnt, "total_bonus": total, "today_count": today}
 
 # ========== AISPORTS BONUS ==========
 async def give_aisports_bonus(user_id: int, bot):
-    delay = random.randint(60, 120)
-    await asyncio.sleep(delay)
+    await asyncio.sleep(random.randint(60, 120))
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT aisports_bonus_received FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT aisports_bonus_received FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
             if not row or row[0] == 1:
                 return
-        await db.execute('UPDATE users SET balance = balance + ?, aisports_bonus_received = 1 WHERE user_id = ?', (AISPORTS_BONUS, user_id))
+        await db.execute("UPDATE users SET balance = balance + ?, aisports_bonus_received = 1 WHERE user_id = ?", (AISPORTS_BONUS, user_id))
         await db.commit()
     try:
-        await bot.send_message(
-            user_id,
-            f"🎁 **30 000 soʻm aisports dan bonus puli hisobingizga qoʻshildi!**\n\n"
-            f"💰 Yangi balans: {await get_user_balance(user_id):,} soʻm\n\n"
-            f"📊 Doʻstlaringizni taklif qilib yana pul ishlashingiz mumkin.",
-            parse_mode="Markdown"
-        )
-        logger.info(f"Aisports bonus {user_id} ga {AISPORTS_BONUS} soʻm berildi.")
+        await bot.send_message(user_id,
+            f"🎁 **30 000 soʻm aisports dan bonus puli hisobingizga qoʻshildi!**\n\n💰 Yangi balans: {await get_user_balance(user_id):,} soʻm\n\n📊 Doʻstlaringizni taklif qilib yana pul ishlashingiz mumkin.",
+            parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Aisports bonus xabari yuborilmadi ({user_id}): {e}")
 
-async def schedule_aisports_bonus(user_id: int, context: ContextTypes.DEFAULT_TYPE):
+async def schedule_aisports_bonus(user_id: int, context):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT aisports_bonus_received FROM users WHERE user_id = ?', (user_id,)) as cursor:
-            row = await cursor.fetchone()
+        async with db.execute("SELECT aisports_bonus_received FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
             if not row or row[0] == 0:
                 asyncio.create_task(give_aisports_bonus(user_id, context.bot))
 
 # ========== ADMIN ==========
 async def is_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,)) as cursor:
-            return await cursor.fetchone() is not None
+        async with db.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,)) as cur:
+            return await cur.fetchone() is not None
 
 async def add_admin(user_id: int, added_by: int) -> bool:
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute('INSERT INTO admins (user_id, added_by) VALUES (?, ?)', (user_id, added_by))
+            await db.execute("INSERT INTO admins (user_id, added_by) VALUES (?, ?)", (user_id, added_by))
             await db.commit()
             return True
     except:
@@ -335,69 +225,58 @@ async def add_admin(user_id: int, added_by: int) -> bool:
 
 async def remove_admin(user_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
+        await db.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
         await db.commit()
         return True
 
 async def get_all_admins():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id, added_by, added_at FROM admins ORDER BY added_at') as cursor:
-            return await cursor.fetchall()
+        async with db.execute("SELECT user_id, added_by, added_at FROM admins ORDER BY added_at") as cur:
+            return await cur.fetchall()
 
 # ========== ANALYSIS ==========
 async def add_analysis(match_id: int, analysis: str, added_by: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT INTO match_analyses (match_id, analysis, added_by)
-            VALUES (?, ?, ?)
-            ON CONFLICT(match_id) DO UPDATE SET
-                analysis = excluded.analysis,
-                added_by = excluded.added_by,
-                added_at = CURRENT_TIMESTAMP
-        ''', (match_id, analysis, added_by))
+        await db.execute("""INSERT INTO match_analyses (match_id, analysis, added_by) VALUES (?, ?, ?)
+            ON CONFLICT(match_id) DO UPDATE SET analysis = excluded.analysis, added_by = excluded.added_by, added_at = CURRENT_TIMESTAMP""",
+            (match_id, analysis, added_by))
         await db.commit()
 
 async def get_analysis(match_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT analysis, added_at FROM match_analyses WHERE match_id = ?', (match_id,)) as cursor:
-            return await cursor.fetchone()
+        async with db.execute("SELECT analysis, added_at FROM match_analyses WHERE match_id = ?", (match_id,)) as cur:
+            return await cur.fetchone()
 
 # ========== SUBSCRIPTIONS ==========
-async def subscribe_user(user_id: int, match_id: int, match_time: str, home: str, away: str, league_code: str):
+async def subscribe_user(user_id: int, match_id: int, match_time: str, home: str, away: str, league: str):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('''
-            INSERT OR REPLACE INTO subscriptions 
+        await db.execute("""INSERT OR REPLACE INTO subscriptions 
             (user_id, match_id, match_time, home_team, away_team, league_code, notified_1h, notified_15m, notified_lineups)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)
-        ''', (user_id, match_id, match_time, home, away, league_code))
+            VALUES (?, ?, ?, ?, ?, ?, 0, 0, 0)""", (user_id, match_id, match_time, home, away, league))
         await db.commit()
 
 async def unsubscribe_user(user_id: int, match_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute('DELETE FROM subscriptions WHERE user_id = ? AND match_id = ?', (user_id, match_id))
+        await db.execute("DELETE FROM subscriptions WHERE user_id = ? AND match_id = ?", (user_id, match_id))
         await db.commit()
 
 async def get_all_subscriptions():
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('''
-            SELECT user_id, match_id, match_time, home_team, away_team, league_code, 
-                   notified_1h, notified_15m, notified_lineups 
-            FROM subscriptions
-        ''') as cursor:
-            return await cursor.fetchall()
+        async with db.execute("""SELECT user_id, match_id, match_time, home_team, away_team, league_code,
+            notified_1h, notified_15m, notified_lineups FROM subscriptions""") as cur:
+            return await cur.fetchall()
 
-async def update_notification_flags(user_id: int, match_id: int, one_hour: bool = False, fifteen_min: bool = False, lineups: bool = False):
+async def update_notification_flags(user_id: int, match_id: int, **kwargs):
     async with aiosqlite.connect(DB_PATH) as db:
         updates = []
         params = []
-        if one_hour:
+        if kwargs.get('one_hour'):
             updates.append("notified_1h = 1")
-        if fifteen_min:
+        if kwargs.get('fifteen_min'):
             updates.append("notified_15m = 1")
-        if lineups:
+        if kwargs.get('lineups'):
             updates.append("notified_lineups = 1")
-        if not updates:
-            return
+        if not updates: return
         query = f"UPDATE subscriptions SET {', '.join(updates)} WHERE user_id = ? AND match_id = ?"
         params.extend([user_id, match_id])
         await db.execute(query, params)
@@ -405,125 +284,88 @@ async def update_notification_flags(user_id: int, match_id: int, one_hour: bool 
 
 async def get_subscribers_for_match(match_id: int):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT user_id FROM subscriptions WHERE match_id = ?', (match_id,)) as cursor:
-            rows = await cursor.fetchall()
-            return [row[0] for row in rows]
+        async with db.execute("SELECT user_id FROM subscriptions WHERE match_id = ?", (match_id,)) as cur:
+            rows = await cur.fetchall()
+            return [r[0] for r in rows]
 
 # ========== MATCH DATA FUNCTIONS ==========
 async def fetch_matches_by_league(league_code: str):
-    if not FOOTBALL_DATA_KEY:
-        return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
     today = datetime.now().strftime("%Y-%m-%d")
     end_date = (datetime.now() + timedelta(days=DAYS_AHEAD)).strftime("%Y-%m-%d")
     url = f"{FOOTBALL_DATA_URL}/matches"
-    headers = {"X-Auth-Token": FOOTBALL_DATA_KEY}
-    params = {
-        "competitions": league_code,
-        "dateFrom": today,
-        "dateTo": end_date,
-        "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"
-    }
-    result = await rate_limited_api_call(url, headers, params)
-    if "success" in result:
-        return {"success": result["success"].get("matches", [])}
-    else:
-        return result
+    params = {"competitions": league_code, "dateFrom": today, "dateTo": end_date, "status": "SCHEDULED,LIVE,IN_PLAY,PAUSED,FINISHED"}
+    res = await rate_limited_api_call(url, HEADERS, params)
+    if "success" in res:
+        return {"success": res["success"].get("matches", [])}
+    return res
 
 async def fetch_match_lineups(match_id: int):
-    """Match tarkiblarini olish (1 ta API call, cached)"""
     match = await get_cached_match(match_id)
     if not match:
         return None
-    home_lineup = match.get("homeTeam", {}).get("lineup", [])
-    away_lineup = match.get("awayTeam", {}).get("lineup", [])
+    home = match.get("homeTeam", {})
+    away = match.get("awayTeam", {})
     return {
-        "home_team": match.get("homeTeam", {}).get("name", "Noma'lum"),
-        "away_team": match.get("awayTeam", {}).get("name", "Noma'lum"),
-        "home_lineup": home_lineup,
-        "away_lineup": away_lineup,
-        "home_coach": match.get("homeTeam", {}).get("coach", {}).get("name") if match.get("homeTeam", {}).get("coach") else None,
-        "away_coach": match.get("awayTeam", {}).get("coach", {}).get("name") if match.get("awayTeam", {}).get("coach") else None,
-        "home_formation": match.get("homeTeam", {}).get("formation"),
-        "away_formation": match.get("awayTeam", {}).get("formation"),
+        "home_team": home.get("name", "Noma'lum"),
+        "away_team": away.get("name", "Noma'lum"),
+        "home_lineup": home.get("lineup", []),
+        "away_lineup": away.get("lineup", []),
+        "home_coach": home.get("coach", {}).get("name") if home.get("coach") else None,
+        "away_coach": away.get("coach", {}).get("name") if away.get("coach") else None,
+        "home_formation": home.get("formation"),
+        "away_formation": away.get("formation"),
         "venue": match.get("venue"),
         "attendance": match.get("attendance")
     }
 
-def format_lineups_message(lineups_data):
-    if not lineups_data:
+def format_lineups(data):
+    if not data or (not data['home_lineup'] and not data['away_lineup']):
         return "📋 Tarkiblar hali e'lon qilinmagan."
-    msg = f"⚽ **{lineups_data['home_team']} vs {lineups_data['away_team']}**\n\n"
-    if lineups_data.get('venue'):
-        msg += f"🏟️ Stadion: {lineups_data['venue']}\n"
-    if lineups_data.get('attendance'):
-        msg += f"👥 Tomoshabin: {lineups_data['attendance']}\n"
-    msg += "\n"
-    msg += f"🏠 **{lineups_data['home_team']}**"
-    if lineups_data.get('home_formation'):
-        msg += f" ({lineups_data['home_formation']})"
-    if lineups_data.get('home_coach'):
-        msg += f" – Murabbiy: {lineups_data['home_coach']}"
+    msg = f"⚽ **{data['home_team']} vs {data['away_team']}**\n\n"
+    if data['venue']: msg += f"🏟️ Stadion: {data['venue']}\n"
+    if data['attendance']: msg += f"👥 Tomoshabin: {data['attendance']}\n"
+    msg += "\n🏠 **" + data['home_team'] + "**"
+    if data['home_formation']: msg += f" ({data['home_formation']})"
+    if data['home_coach']: msg += f" – Murabbiy: {data['home_coach']}"
     msg += "\n" + "━" * 30 + "\n"
-    if lineups_data['home_lineup']:
-        for player in lineups_data['home_lineup'][:11]:
-            name = player.get('name', 'Noma\'lum')
-            position = player.get('position', '')
-            shirt = player.get('shirtNumber', '')
-            position_icon = "🥅" if "Goalkeeper" in position else "🛡️" if "Defender" in position else "⚡" if "Midfielder" in position else "🎯"
-            msg += f"{position_icon} {shirt} – {name} ({position})\n"
-    else:
-        msg += "❌ Tarkib e'lon qilinmagan\n"
-    msg += "\n"
-    msg += f"🛣️ **{lineups_data['away_team']}**"
-    if lineups_data.get('away_formation'):
-        msg += f" ({lineups_data['away_formation']})"
-    if lineups_data.get('away_coach'):
-        msg += f" – Murabbiy: {lineups_data['away_coach']}"
+    if data['home_lineup']:
+        for p in data['home_lineup'][:11]:
+            pos = p.get('position', '')
+            icon = "🥅" if "Goalkeeper" in pos else "🛡️" if "Defender" in pos else "⚡" if "Midfielder" in pos else "🎯"
+            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', 'Noma\'lum')} ({pos})\n"
+    else: msg += "❌ Tarkib e'lon qilinmagan\n"
+    msg += "\n🛣️ **" + data['away_team'] + "**"
+    if data['away_formation']: msg += f" ({data['away_formation']})"
+    if data['away_coach']: msg += f" – Murabbiy: {data['away_coach']}"
     msg += "\n" + "━" * 30 + "\n"
-    if lineups_data['away_lineup']:
-        for player in lineups_data['away_lineup'][:11]:
-            name = player.get('name', 'Noma\'lum')
-            position = player.get('position', '')
-            shirt = player.get('shirtNumber', '')
-            position_icon = "🥅" if "Goalkeeper" in position else "🛡️" if "Defender" in position else "⚡" if "Midfielder" in position else "🎯"
-            msg += f"{position_icon} {shirt} – {name} ({position})\n"
-    else:
-        msg += "❌ Tarkib e'lon qilinmagan\n"
+    if data['away_lineup']:
+        for p in data['away_lineup'][:11]:
+            pos = p.get('position', '')
+            icon = "🥅" if "Goalkeeper" in pos else "🛡️" if "Defender" in pos else "⚡" if "Midfielder" in pos else "🎯"
+            msg += f"{icon} {p.get('shirtNumber', '')} – {p.get('name', 'Noma\'lum')} ({pos})\n"
+    else: msg += "❌ Tarkib e'lon qilinmagan\n"
     return msg
 
-def generate_match_links(match_id: int, home_team: str, away_team: str, league_code: str):
+def generate_match_links(mid, home, away, league):
     links = []
-    espn_url = f"https://www.espn.com/soccer/match/_/gameId/{match_id}"
-    links.append(("📺 ESPN", espn_url))
-    if league_code == "PL":
-        bbc_url = f"https://www.bbc.com/sport/football/{match_id}"
-        links.append(("📰 BBC Sport", bbc_url))
-    sky_url = f"https://www.skysports.com/football/{home_team.lower().replace(' ', '-')}-vs-{away_team.lower().replace(' ', '-')}/{match_id}"
-    links.append(("⚡ Sky Sports", sky_url))
-    if league_code == "PD":
-        marca_url = f"https://www.marca.com/futbol/primera-division/{match_id}.html"
-        as_url = f"https://as.com/futbol/primera/{match_id}.html"
-        links.append(("📘 MARCA", marca_url))
-        links.append(("📙 AS", as_url))
-    elif league_code == "SA":
-        gazzetta_url = f"https://www.gazzetta.it/calcio/serie-a/match-{match_id}.shtml"
-        corriere_url = f"https://www.corriere.it/calcio/serie-a/{match_id}.shtml"
-        links.append(("📗 La Gazzetta", gazzetta_url))
-        links.append(("📕 Corriere", corriere_url))
-    elif league_code == "BL1":
-        kicker_url = f"https://www.kicker.de/{match_id}/aufstellung"
-        bild_url = f"https://www.bild.de/sport/fussball/bundesliga/{match_id}.html"
-        links.append(("📘 Kicker", kicker_url))
-        links.append(("📙 Bild", bild_url))
-    elif league_code == "FL1":
-        lequipe_url = f"https://www.lequipe.fr/Football/match/{match_id}"
-        rmc_url = f"https://rmcsport.bfmtv.com/football/match-{match_id}.html"
-        links.append(("📗 L'Equipe", lequipe_url))
-        links.append(("📕 RMC Sport", rmc_url))
-    flashscore_url = f"https://www.flashscore.com/match/{match_id}/#/lineups"
-    links.append(("⚽ FlashScore", flashscore_url))
-    sofascore_url = f"https://www.sofascore.com/football/match/{match_id}"
-    links.append(("📊 SofaScore", sofascore_url))
+    links.append(("📺 ESPN", f"https://www.espn.com/soccer/match/_/gameId/{mid}"))
+    if league == "PL":
+        links.append(("📰 BBC Sport", f"https://www.bbc.com/sport/football/{mid}"))
+    links.append(("⚡ Sky Sports", f"https://www.skysports.com/football/{home.lower().replace(' ', '-')}-vs-{away.lower().replace(' ', '-')}/{mid}"))
+    if league == "PD":
+        links.append(("📘 MARCA", f"https://www.marca.com/futbol/primera-division/{mid}.html"))
+        links.append(("📙 AS", f"https://as.com/futbol/primera/{mid}.html"))
+    elif league == "SA":
+        links.append(("📗 La Gazzetta", f"https://www.gazzetta.it/calcio/serie-a/match-{mid}.shtml"))
+        links.append(("📕 Corriere", f"https://www.corriere.it/calcio/serie-a/{mid}.shtml"))
+    elif league == "BL1":
+        links.append(("📘 Kicker", f"https://www.kicker.de/{mid}/aufstellung"))
+        links.append(("📙 Bild", f"https://www.bild.de/sport/fussball/bundesliga/{mid}.html"))
+    elif league == "FL1":
+        links.append(("📗 L'Equipe", f"https://www.lequipe.fr/Football/match/{mid}"))
+        links.append(("📕 RMC Sport", f"https://rmcsport.bfmtv.com/football/match-{mid}.html"))
+    links.append(("⚽ FlashScore", f"https://www.flashscore.com/match/{mid}/#/lineups"))
+    links.append(("📊 SofaScore", f"https://www.sofascore.com/football/match/{mid}"))
     return links
 
 def format_links_message(links):
@@ -534,589 +376,412 @@ def format_links_message(links):
 
 # ========== INLINE KEYBOARDS ==========
 def money_row():
-    return [
-        InlineKeyboardButton("💰 Pul ishlash", callback_data="money_info"),
-        InlineKeyboardButton("💳 Balans", callback_data="balance_info"),
-        InlineKeyboardButton("💸 Pul yechish", callback_data="withdraw_info")
-    ]
+    return [InlineKeyboardButton("💰 Pul ishlash", callback_data="money_info"),
+            InlineKeyboardButton("💳 Balans", callback_data="balance_info"),
+            InlineKeyboardButton("💸 Pul yechish", callback_data="withdraw_info")]
 
 def get_leagues_keyboard():
-    keyboard = []
+    kb = []
     for code, data in TOP_LEAGUES.items():
-        keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{code}")])
-    keyboard.append(money_row())
-    return InlineKeyboardMarkup(keyboard)
+        kb.append([InlineKeyboardButton(data["name"], callback_data=f"league_{code}")])
+    kb.append(money_row())
+    return InlineKeyboardMarkup(kb)
 
 def build_matches_keyboard(matches):
-    keyboard = []
-    for match in matches[:10]:
-        home = match["homeTeam"]["name"]
-        away = match["awayTeam"]["name"]
-        match_date = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
-        tashkent_time = match_date + timedelta(hours=5)
-        date_str = tashkent_time.strftime("%d.%m %H:%M")
-        match_id = match["id"]
-        button_text = f"{home} – {away} ({date_str})"
-        callback_data = f"match_{match_id}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
-    keyboard.append(money_row())
-    return InlineKeyboardMarkup(keyboard)
+    kb = []
+    for m in matches[:10]:
+        date_obj = datetime.strptime(m["utcDate"], "%Y-%m-%dT%H:%M:%SZ") + timedelta(hours=5)
+        date_str = date_obj.strftime("%d.%m %H:%M")
+        kb.append([InlineKeyboardButton(f"{m['homeTeam']['name']} – {m['awayTeam']['name']} ({date_str})", callback_data=f"match_{m['id']}")])
+    kb.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
+    kb.append(money_row())
+    return InlineKeyboardMarkup(kb)
 
-def build_match_detail_keyboard(match_id: int, is_subscribed: bool = False, lineups_available: bool = False):
-    keyboard = []
+def build_match_detail_keyboard(mid, is_subscribed=False, lineups_available=False):
+    kb = []
     if is_subscribed:
-        keyboard.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{match_id}")])
+        kb.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{mid}")])
     else:
-        keyboard.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{match_id}")])
-    keyboard.append([
-        InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
-        InlineKeyboardButton("📊 Chuqur tahlil", url="https://futbolinside.netlify.app/"),
-        InlineKeyboardButton("🎲 Stavka qilish", url="https://superlative-twilight-47ef34.netlify.app/")
-    ])
+        kb.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{mid}")])
+    kb.append([InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
+               InlineKeyboardButton("📊 Chuqur tahlil", url="https://futbolinside.netlify.app/"),
+               InlineKeyboardButton("🎲 Stavka qilish", url="https://superlative-twilight-47ef34.netlify.app/")])
     if lineups_available:
-        keyboard.append([InlineKeyboardButton("📋 Tarkiblarni ko‘rish", callback_data=f"lineups_{match_id}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
-    keyboard.append(money_row())
-    return InlineKeyboardMarkup(keyboard)
+        kb.append([InlineKeyboardButton("📋 Tarkiblarni ko‘rish", callback_data=f"lineups_{mid}")])
+    kb.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
+    kb.append(money_row())
+    return InlineKeyboardMarkup(kb)
 
 # ========== HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    user_id = user.id
+    u = update.effective_user
     args = context.args
-    referrer_id = None
+    ref = None
     if args and args[0].startswith("ref_"):
-        try:
-            referrer_id = int(args[0].replace("ref_", ""))
-            if referrer_id == user_id:
-                referrer_id = None
-        except:
-            referrer_id = None
-
-    await get_or_create_user(user_id, referrer_id, bot=context.bot, referred_user_name=user.first_name)
-    await schedule_aisports_bonus(user_id, context)
-
+        try: ref = int(args[0].replace("ref_", ""))
+        except: pass
+        if ref == u.id: ref = None
+    await get_or_create_user(u.id, ref, context.bot, u.first_name)
+    await schedule_aisports_bonus(u.id, context)
     bot_username = (await context.bot.get_me()).username
-    referral_link = await get_referral_link(user_id, bot_username)
-
-    welcome_text = (
-        f"👋 Assalomu alaykum, {user.first_name}!\n\n"
-        f"⚽ Ushbu bot orqali top 5 chempionat oʻyinlarini kuzatishingiz, "
-        f"tahlillarni olishingiz va oʻyinlar haqida eslatmalarni sozlashingiz mumkin.\n\n"
-        f"💰 **Pul ishlash imkoniyati**:\n"
-        f"Doʻstlaringizni taklif qiling va har bir taklif uchun **{REFERRAL_BONUS:,} soʻm** oling!\n"
-        f"Sizning referal havolangiz:\n`{referral_link}`\n\n"
-        f"💸 Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**, kuniga **1 marta**.\n\n"
-        f"🎁 **Aisports maxsus sovgʻasi**: 30 000 soʻm bonus puli 1-2 daqiqadan soʻng hisobingizga qoʻshiladi!\n\n"
-        f"Quyida ligalardan birini tanlang:"
-    )
-    await update.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_leagues_keyboard())
+    ref_link = await get_referral_link(u.id, bot_username)
+    text = (f"👋 Assalomu alaykum, {u.first_name}!\n\n⚽ Ushbu bot orqali top 5 chempionat oʻyinlarini kuzatishingiz, "
+            f"tahlillarni olishingiz va oʻyinlar haqida eslatmalarni sozlashingiz mumkin.\n\n"
+            f"💰 **Pul ishlash imkoniyati**:\nDoʻstlaringizni taklif qiling va har bir taklif uchun **{REFERRAL_BONUS:,} soʻm** oling!\n"
+            f"Sizning referal havolangiz:\n`{ref_link}`\n\n"
+            f"💸 Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**, kuniga **1 marta**.\n\n"
+            f"🎁 **Aisports maxsus sovgʻasi**: 30 000 soʻm bonus puli 1-2 daqiqadan soʻng hisobingizga qoʻshiladi!\n\n"
+            f"Quyida ligalardan birini tanlang:")
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=get_leagues_keyboard())
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user_id = update.effective_user.id
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    uid = update.effective_user.id
 
     # ---------- PUL ISHLASH INFO + SHARE ----------
     if data == "money_info":
         bot_username = (await context.bot.get_me()).username
-        referral_link = await get_referral_link(user_id, bot_username)
-        stats = await get_referral_stats(user_id)
-        balance = await get_user_balance(user_id)
-        text = (
-            f"💰 **Pul ishlash tizimi**\n\n"
-            f"• Har bir doʻstingizni taklif qilish uchun: **+{REFERRAL_BONUS:,} soʻm**\n"
-            f"• Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**\n"
-            f"• Kuniga **1 marta** pul yechish mumkin.\n\n"
-            f"📊 **Sizning statistika:**\n"
-            f"• Balans: **{balance:,} soʻm**\n"
-            f"• Taklif qilinganlar: **{stats['count']} ta**\n"
-            f"• Bugun taklif qilingan: **{stats['today_count']} ta**\n"
-            f"• Jami bonus: **{stats['total_bonus']:,} soʻm**\n\n"
-            f"🔗 **Sizning referal havolangiz:**\n`{referral_link}`\n\n"
-            f"⚠️ Doʻstingiz botga start bosganida bonus avtomatik hisoblanadi."
-        )
-        share_text = (
-            f"🤖 Futbol tahlillari va pul ishlash botiga taklif!\n\n"
-            f"Bot orqali top-5 chempionat oʻyinlarini kuzating, tahlillarni oling va "
-            f"doʻstlaringizni taklif qilib pul ishlang.\n\n"
-            f"🎁 Har bir taklif uchun +{REFERRAL_BONUS:,} soʻm bonus!\n"
-            f"👇 Quyidagi havola orqali botga oʻting:\n{referral_link}"
-        )
-        share_url = f"https://t.me/share/url?url={quote(referral_link)}&text={quote(share_text)}"
-        keyboard = [
-            [InlineKeyboardButton("📤 Do'stlarga yuborish", url=share_url)],
-            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
-            money_row()
-        ]
-        back_keyboard = InlineKeyboardMarkup(keyboard)
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
+        ref_link = await get_referral_link(uid, bot_username)
+        stats = await get_referral_stats(uid)
+        bal = await get_user_balance(uid)
+        text = (f"💰 **Pul ishlash tizimi**\n\n• Har bir doʻstingizni taklif qilish uchun: **+{REFERRAL_BONUS:,} soʻm**\n"
+                f"• Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**\n• Kuniga **1 marta** pul yechish mumkin.\n\n"
+                f"📊 **Sizning statistika:**\n• Balans: **{bal:,} soʻm**\n• Taklif qilinganlar: **{stats['count']} ta**\n"
+                f"• Bugun taklif qilingan: **{stats['today_count']} ta**\n• Jami bonus: **{stats['total_bonus']:,} soʻm**\n\n"
+                f"🔗 **Sizning referal havolangiz:**\n`{ref_link}`\n\n⚠️ Doʻstingiz botga start bosganida bonus avtomatik hisoblanadi.")
+        share_text = (f"🤖 Futbol tahlillari va pul ishlash botiga taklif!\n\n"
+                      f"Bot orqali top-5 chempionat oʻyinlarini kuzating, tahlillarni oling va doʻstlaringizni taklif qilib pul ishlang.\n\n"
+                      f"🎁 Har bir taklif uchun +{REFERRAL_BONUS:,} soʻm bonus!\n👇 Quyidagi havola orqali botga oʻting:\n{ref_link}")
+        share_url = f"https://t.me/share/url?url={quote(ref_link)}&text={quote(share_text)}"
+        kb = [[InlineKeyboardButton("📤 Do'stlarga yuborish", url=share_url)],
+              [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
+              money_row()]
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     # ---------- BALANS ----------
     if data == "balance_info":
-        balance = await get_user_balance(user_id)
-        stats = await get_referral_stats(user_id)
-        text = (
-            f"💳 **Sizning balansingiz**\n\n"
-            f"💰 Balans: **{balance:,} soʻm**\n"
-            f"👥 Referallar: **{stats['count']} ta**\n"
-            f"🎁 Bonus: **{stats['total_bonus']:,} soʻm**\n\n"
-            f"💸 Pul yechish uchun minimal miqdor: **{MIN_WITHDRAW:,} soʻm**\n"
-            f"📅 Kuniga **1 marta** yechish mumkin."
-        )
-        back_keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
-            money_row()
-        ])
-        await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
+        bal = await get_user_balance(uid)
+        stats = await get_referral_stats(uid)
+        text = (f"💳 **Sizning balansingiz**\n\n💰 Balans: **{bal:,} soʻm**\n👥 Referallar: **{stats['count']} ta**\n"
+                f"🎁 Bonus: **{stats['total_bonus']:,} soʻm**\n\n💸 Pul yechish uchun minimal miqdor: **{MIN_WITHDRAW:,} soʻm**\n📅 Kuniga **1 marta** yechish mumkin.")
+        kb = [[InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")], money_row()]
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     # ---------- PUL YECHISH ----------
     if data == "withdraw_info":
-        balance = await get_user_balance(user_id)
-        if balance < MIN_WITHDRAW:
-            text = f"❌ Sizda yetarli mablagʻ yoʻq.\nBalans: **{balance:,} soʻm**\nMinimal yechish: **{MIN_WITHDRAW:,} soʻm**\n\nDoʻstlaringizni taklif qilib pul ishlang!"
-            back_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
-                money_row()
-            ])
-            await query.message.reply_text(text, parse_mode="Markdown", reply_markup=back_keyboard)
+        bal = await get_user_balance(uid)
+        if bal < MIN_WITHDRAW:
+            text = f"❌ Sizda yetarli mablagʻ yoʻq.\nBalans: **{bal:,} soʻm**\nMinimal yechish: **{MIN_WITHDRAW:,} soʻm**\n\nDoʻstlaringizni taklif qilib pul ishlang!"
+            kb = [[InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")], money_row()]
+            await q.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
             return
-        can, msg = await can_withdraw(user_id)
+        can, msg = await can_withdraw(uid)
         if not can:
-            back_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
-                money_row()
-            ])
-            await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=back_keyboard)
+            kb = [[InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")], money_row()]
+            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
             return
-        success = await register_withdraw(user_id, MIN_WITHDRAW)
+        success = await register_withdraw(uid, MIN_WITHDRAW)
         if success:
-            withdraw_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💸 Pul yechish (test)", url="https://futbolinsidepulyechish.netlify.app/")],
-                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
-                money_row()
-            ])
-            await query.message.reply_text(
-                f"✅ **Pul yechish soʻrovingiz qabul qilindi!**\n\n"
-                f"Yechilgan miqdor: **{MIN_WITHDRAW:,} soʻm**\n"
-                f"Qolgan balans: **{balance - MIN_WITHDRAW:,} soʻm**\n\n"
-                f"⚠️ Bu test rejimi. Pul yechish uchun quyidagi havolaga oʻting:",
-                parse_mode="Markdown",
-                reply_markup=withdraw_keyboard
-            )
+            kb = [[InlineKeyboardButton("💸 Pul yechish (test)", url="https://futbolinsidepulyechish.netlify.app/")],
+                  [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")], money_row()]
+            await q.message.reply_text(
+                f"✅ **Pul yechish soʻrovingiz qabul qilindi!**\n\nYechilgan miqdor: **{MIN_WITHDRAW:,} soʻm**\nQolgan balans: **{bal - MIN_WITHDRAW:,} soʻm**\n\n⚠️ Bu test rejimi. Pul yechish uchun quyidagi havolaga oʻting:",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
         else:
-            back_keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")],
-                money_row()
-            ])
-            await query.message.reply_text("❌ Xatolik yuz berdi. Qayta urinib koʻring.", reply_markup=back_keyboard)
+            kb = [[InlineKeyboardButton("🏠 Bosh menyu", callback_data="back_to_start")], money_row()]
+            await q.message.reply_text("❌ Xatolik yuz berdi. Qayta urinib koʻring.", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     # ---------- BOSH MENYU ----------
     if data == "back_to_start":
-        user = update.effective_user
-        await get_or_create_user(user_id, None)
+        u = update.effective_user
+        await get_or_create_user(u.id, None)
         bot_username = (await context.bot.get_me()).username
-        referral_link = await get_referral_link(user_id, bot_username)
-        welcome_text = (
-            f"👋 Assalomu alaykum, {user.first_name}!\n\n"
-            f"⚽ Ushbu bot orqali top 5 chempionat oʻyinlarini kuzatishingiz, "
-            f"tahlillarni olishingiz va oʻyinlar haqida eslatmalarni sozlashingiz mumkin.\n\n"
-            f"💰 **Pul ishlash imkoniyati**:\n"
-            f"Doʻstlaringizni taklif qiling va har bir taklif uchun **{REFERRAL_BONUS:,} soʻm** oling!\n"
-            f"Sizning referal havolangiz:\n`{referral_link}`\n\n"
-            f"💸 Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**, kuniga **1 marta**.\n\n"
-            f"Quyida ligalardan birini tanlang:"
-        )
-        await query.message.reply_text(welcome_text, parse_mode="Markdown", reply_markup=get_leagues_keyboard())
+        ref_link = await get_referral_link(u.id, bot_username)
+        text = (f"👋 Assalomu alaykum, {u.first_name}!\n\n⚽ Ushbu bot orqali top 5 chempionat oʻyinlarini kuzatishingiz, "
+                f"tahlillarni olishingiz va oʻyinlar haqida eslatmalarni sozlashingiz mumkin.\n\n"
+                f"💰 **Pul ishlash imkoniyati**:\nDoʻstlaringizni taklif qiling va har bir taklif uchun **{REFERRAL_BONUS:,} soʻm** oling!\n"
+                f"Sizning referal havolangiz:\n`{ref_link}`\n\n"
+                f"💸 Minimal pul yechish: **{MIN_WITHDRAW:,} soʻm**, kuniga **1 marta**.\n\nQuyida ligalardan birini tanlang:")
+        await q.message.reply_text(text, parse_mode="Markdown", reply_markup=get_leagues_keyboard())
         return
 
-    # ---------- FUTBOL QISMI ----------
+    # ---------- FUTBOL ----------
     if data == "leagues":
-        await query.edit_message_text(
-            "sport uchun eng yuqori sifatdagi taxlilarni olish uchun Quyidagi chempionatlardan birini tanlang:",
-            reply_markup=get_leagues_keyboard()
-        )
+        await q.edit_message_text("sport uchun eng yuqori sifatdagi taxlilarni olish uchun Quyidagi chempionatlardan birini tanlang:",
+                                  reply_markup=get_leagues_keyboard())
         return
 
     if data.startswith("league_"):
-        league_code = data.split("_")[1]
-        league_info = TOP_LEAGUES.get(league_code)
-        if not league_info:
-            await query.edit_message_text("❌ Notoʻgʻri tanlov.")
+        code = data.split("_")[1]
+        info = TOP_LEAGUES.get(code)
+        if not info:
+            await q.edit_message_text("❌ Notoʻgʻri tanlov.")
             return
-        await query.edit_message_text(f"⏳ {league_info['name']} – oʻyinlar yuklanmoqda...")
-        result = await fetch_matches_by_league(league_code)
-        if "error" in result:
-            await query.edit_message_text(result["error"], reply_markup=get_leagues_keyboard())
+        await q.edit_message_text(f"⏳ {info['name']} – oʻyinlar yuklanmoqda...")
+        res = await fetch_matches_by_league(code)
+        if "error" in res:
+            await q.edit_message_text(res["error"], reply_markup=get_leagues_keyboard())
             return
-        matches = result["success"]
+        matches = res["success"]
         if not matches:
-            await query.edit_message_text(
-                f"⚽ {league_info['name']}\n{DAYS_AHEAD} kun ichida oʻyinlar yoʻq.",
-                reply_markup=get_leagues_keyboard()
-            )
+            await q.edit_message_text(f"⚽ {info['name']}\n{DAYS_AHEAD} kun ichida oʻyinlar yoʻq.", reply_markup=get_leagues_keyboard())
             return
-        keyboard = build_matches_keyboard(matches)
-        await query.edit_message_text(
-            f"🏆 **{league_info['name']}** – {DAYS_AHEAD} kun ichidagi oʻyinlar:\n\n"
-            "Oʻyin ustiga bosing, tahlil va kuzatish imkoniyati.",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
+        await q.edit_message_text(f"🏆 **{info['name']}** – {DAYS_AHEAD} kun ichidagi oʻyinlar:\n\nOʻyin ustiga bosing, tahlil va kuzatish imkoniyati.",
+                                  parse_mode="Markdown", reply_markup=build_matches_keyboard(matches))
         return
 
     if data.startswith("match_"):
-        match_id = int(data.split("_")[1])
-        analysis = await get_analysis(match_id)
-        
-        # Keshdan olish
-        match = await get_cached_match(match_id)
-        league_code = "PL"
-        home_team = "Noma'lum"
-        away_team = "Noma'lum"
+        mid = int(data.split("_")[1])
+        analysis_row = await get_analysis(mid)
+        match = await get_cached_match(mid)
+        league = "PL"
+        home = away = "Noma'lum"
         if match:
-            competition = match.get("competition", {}).get("code", "")
-            if competition in TOP_LEAGUES:
-                league_code = competition
-            home_team = match.get("homeTeam", {}).get("name", "Noma'lum")
-            away_team = match.get("awayTeam", {}).get("name", "Noma'lum")
-        
-        if analysis:
-            text, added_at = analysis
-            added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
-            date_str = added_at_dt.strftime("%d.%m.%Y %H:%M")
-            msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{match_id}`\n📝 **Tahlil:**\n{text}\n\n🕐 Qoʻshilgan: {date_str}"
+            league = match.get("competition", {}).get("code", "PL")
+            home = match.get("homeTeam", {}).get("name", "Noma'lum")
+            away = match.get("awayTeam", {}).get("name", "Noma'lum")
+        if analysis_row:
+            text, added_at = analysis_row
+            date_str = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
+            safe_text = escape_markdown(text, version=2)
+            msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{mid}`\n📝 **Tahlil:**\n{safe_text}\n\n🕐 Qoʻshilgan: {date_str}"
         else:
-            msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{match_id}`\n📊 Hozircha tahlil mavjud emas."
-            if await is_admin(user_id):
-                msg += f"\n\n💡 Admin: `/addanalysis {match_id} <tahlil>`"
-        
+            msg = f"⚽ **Oʻyin tahlili**\n\n🆔 Match ID: `{mid}`\n📊 Hozircha tahlil mavjud emas."
+            if await is_admin(uid):
+                msg += f"\n\n💡 Admin: `/addanalysis {mid} <tahlil>`"
         async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute('SELECT 1 FROM subscriptions WHERE user_id = ? AND match_id = ?', (user_id, match_id)) as cursor:
-                is_subscribed = await cursor.fetchone() is not None
-        
-        lineups_data = await fetch_match_lineups(match_id)
-        lineups_available = lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup'])
-        
-        keyboard = build_match_detail_keyboard(match_id, is_subscribed, lineups_available)
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+            async with db.execute("SELECT 1 FROM subscriptions WHERE user_id = ? AND match_id = ?", (uid, mid)) as cur:
+                subscribed = await cur.fetchone() is not None
+        lineups = await fetch_match_lineups(mid)
+        lineups_avail = lineups and (lineups['home_lineup'] or lineups['away_lineup'])
+        kb = build_match_detail_keyboard(mid, subscribed, lineups_avail)
+
+        # Uzun matnni bo'lib yuborish
+        if len(msg) > 4096:
+            await q.edit_message_text(msg[:4090] + "...", parse_mode="Markdown", reply_markup=kb)
+            await context.bot.send_message(uid, f"📎 **Tahlilning davomi:**\n\n{msg[4090:]}", parse_mode="Markdown")
+        else:
+            await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
         return
 
     if data.startswith("lineups_"):
-        match_id = int(data.split("_")[1])
-        await query.edit_message_text("⏳ Tarkiblar yuklanmoqda...")
-        lineups_data = await fetch_match_lineups(match_id)
-        if lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup']):
-            msg = format_lineups_message(lineups_data)
+        mid = int(data.split("_")[1])
+        await q.edit_message_text("⏳ Tarkiblar yuklanmoqda...")
+        lineups = await fetch_match_lineups(mid)
+        if lineups and (lineups['home_lineup'] or lineups['away_lineup']):
+            msg = format_lineups(lineups)
         else:
             msg = "❌ Bu oʻyin uchun tarkiblar hali eʼlon qilinmagan."
-        
-        match = await get_cached_match(match_id)
-        league_code = "PL"
-        home_team = "Noma'lum"
-        away_team = "Noma'lum"
+        match = await get_cached_match(mid)
+        league = "PL"
+        home = away = "Noma'lum"
         if match:
-            competition = match.get("competition", {}).get("code", "")
-            if competition in TOP_LEAGUES:
-                league_code = competition
-            home_team = match.get("homeTeam", {}).get("name", "Noma'lum")
-            away_team = match.get("awayTeam", {}).get("name", "Noma'lum")
-        
-        links = generate_match_links(match_id, home_team, away_team, league_code)
+            league = match.get("competition", {}).get("code", "PL")
+            home = match.get("homeTeam", {}).get("name", "Noma'lum")
+            away = match.get("awayTeam", {}).get("name", "Noma'lum")
+        links = generate_match_links(mid, home, away, league)
         msg += "\n\n" + format_links_message(links)
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 Oʻyinga qaytish", callback_data=f"match_{match_id}")],
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔙 Oʻyinga qaytish", callback_data=f"match_{mid}")],
             [InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")],
-            money_row()
-        ])
-        await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+            money_row()])
+        await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=kb)
         return
 
     if data.startswith("subscribe_"):
-        match_id = int(data.split("_")[1])
-        match = await get_cached_match(match_id)
+        mid = int(data.split("_")[1])
+        match = await get_cached_match(mid)
         if not match:
-            await query.answer("❌ Match ma'lumotlarini olishda xatolik", show_alert=True)
+            await q.answer("❌ Match ma'lumotlarini olishda xatolik", show_alert=True)
             return
         home = match["homeTeam"]["name"]
         away = match["awayTeam"]["name"]
-        match_time = match["utcDate"]
-        competition = match.get("competition", {}).get("code", "")
-        league_code = competition if competition in TOP_LEAGUES else "PL"
-        await subscribe_user(user_id, match_id, match_time, home, away, league_code)
-        new_keyboard = build_match_detail_keyboard(match_id, is_subscribed=True)
-        await query.edit_message_reply_markup(reply_markup=new_keyboard)
-        await query.answer("✅ Kuzatish boshlandi!", show_alert=False)
+        t = match["utcDate"]
+        league = match.get("competition", {}).get("code", "PL")
+        await subscribe_user(uid, mid, t, home, away, league)
+        await q.edit_message_reply_markup(reply_markup=build_match_detail_keyboard(mid, is_subscribed=True))
+        await q.answer("✅ Kuzatish boshlandi!", show_alert=False)
         return
 
     if data.startswith("unsubscribe_"):
-        match_id = int(data.split("_")[1])
-        await unsubscribe_user(user_id, match_id)
-        new_keyboard = build_match_detail_keyboard(match_id, is_subscribed=False)
-        await query.edit_message_reply_markup(reply_markup=new_keyboard)
-        await query.answer("❌ Kuzatish bekor qilindi", show_alert=False)
+        mid = int(data.split("_")[1])
+        await unsubscribe_user(uid, mid)
+        await q.edit_message_reply_markup(reply_markup=build_match_detail_keyboard(mid, is_subscribed=False))
+        await q.answer("❌ Kuzatish bekor qilindi", show_alert=False)
         return
 
 # ========== NOTIFICATION SCHEDULER (OPTIMIZED) ==========
 async def notification_scheduler(app: Application):
-    """Har daqiqa ishlaydi, optimallashtirilgan - match bo'yicha guruhlangan"""
     while True:
         try:
-            now = datetime.utcnow()
-            subscriptions = await get_all_subscriptions()
-            
-            # Match ID bo'yicha guruhlash
-            match_subscribers = {}
-            for sub in subscriptions:
-                user_id, match_id, match_time_str, home, away, league_code, notified_1h, notified_15m, notified_lineups = sub
-                if match_id not in match_subscribers:
-                    match_subscribers[match_id] = {
-                        "match_time": datetime.strptime(match_time_str, "%Y-%m-%dT%H:%M:%SZ"),
-                        "home": home,
-                        "away": away,
-                        "league_code": league_code,
-                        "subscribers": [],
-                        "notified_1h_already": False,
-                        "notified_15m_already": False,
-                        "notified_lineups_already": False
-                    }
-                match_subscribers[match_id]["subscribers"].append({
-                    "user_id": user_id,
-                    "notified_1h": notified_1h,
-                    "notified_15m": notified_15m,
-                    "notified_lineups": notified_lineups
-                })
-            
-            # Har bir match uchun bir marta API call
-            for match_id, data in match_subscribers.items():
-                delta = data["match_time"] - now
-                minutes_left = delta.total_seconds() / 60
-                
-                # 1 soat qolganda
-                if not data["notified_1h_already"] and any(not s["notified_1h"] for s in data["subscribers"]):
-                    if 55 <= minutes_left <= 65:
-                        # 1 soat xabarini barcha obunachilarga yuborish
-                        for subscriber in data["subscribers"]:
-                            if not subscriber["notified_1h"]:
+            subs = await get_all_subscriptions()
+            groups = {}
+            for s in subs:
+                uid, mid, tstr, home, away, league, n1, n15, nl = s
+                if mid not in groups:
+                    groups[mid] = {"time": datetime.strptime(tstr, "%Y-%m-%dT%H:%M:%SZ"), "home": home, "away": away, "league": league,
+                                   "users": [], "n1_flag": False, "n15_flag": False, "nl_flag": False}
+                groups[mid]["users"].append({"id": uid, "n1": n1, "n15": n15, "nl": nl})
+            for mid, g in groups.items():
+                delta = (g["time"] - datetime.utcnow()).total_seconds() / 60
+                # 1 soat
+                if not g["n1_flag"] and any(not u["n1"] for u in g["users"]):
+                    if 55 <= delta <= 65:
+                        for u in g["users"]:
+                            if not u["n1"]:
                                 try:
-                                    await app.bot.send_message(
-                                        subscriber["user_id"],
-                                        f"⏰ **1 soat qoldi!**\n\n{data['home']} – {data['away']}\n🕒 {data['match_time'].strftime('%d.%m.%Y %H:%M')} UTC+0\n\n📋 Tarkiblar eʼlon qilinishi kutilmoqda.",
-                                        parse_mode="Markdown"
-                                    )
-                                    await update_notification_flags(subscriber["user_id"], match_id, one_hour=True)
+                                    await app.bot.send_message(u["id"],
+                                        f"⏰ **1 soat qoldi!**\n\n{g['home']} – {g['away']}\n🕒 {g['time'].strftime('%d.%m.%Y %H:%M')} UTC+0\n\n📋 Tarkiblar eʼlon qilinishi kutilmoqda.",
+                                        parse_mode="Markdown")
+                                    await update_notification_flags(u["id"], mid, one_hour=True)
                                 except Exception as e:
-                                    logger.error(f"1h notification error for user {subscriber['user_id']}: {e}")
-                        
-                        # Lineups - faqat bir marta olinadi va barchaga yuboriladi
-                        if not data["notified_lineups_already"] and any(not s["notified_lineups"] for s in data["subscribers"]):
-                            lineups_data = await fetch_match_lineups(match_id)
-                            if lineups_data and (lineups_data['home_lineup'] or lineups_data['away_lineup']):
-                                lineup_msg = format_lineups_message(lineups_data)
-                                links = generate_match_links(match_id, data['home'], data['away'], data['league_code'])
+                                    logger.error(f"1h notification error: {e}")
+                        g["n1_flag"] = True
+                        # Lineups (faqat bir marta)
+                        if not g["nl_flag"] and any(not u["nl"] for u in g["users"]):
+                            lu = await fetch_match_lineups(mid)
+                            if lu and (lu['home_lineup'] or lu['away_lineup']):
+                                lineup_msg = format_lineups(lu)
+                                links = generate_match_links(mid, g['home'], g['away'], g['league'])
                                 links_msg = format_links_message(links)
-                                
-                                for subscriber in data["subscribers"]:
-                                    if not subscriber["notified_lineups"]:
+                                for u in g["users"]:
+                                    if not u["nl"]:
                                         try:
-                                            await app.bot.send_message(subscriber["user_id"], lineup_msg, parse_mode="Markdown")
-                                            await app.bot.send_message(subscriber["user_id"], links_msg, parse_mode="Markdown", disable_web_page_preview=True)
-                                            await update_notification_flags(subscriber["user_id"], match_id, lineups=True)
+                                            await app.bot.send_message(u["id"], lineup_msg, parse_mode="Markdown")
+                                            await app.bot.send_message(u["id"], links_msg, parse_mode="Markdown", disable_web_page_preview=True)
+                                            await update_notification_flags(u["id"], mid, lineups=True)
                                         except Exception as e:
-                                            logger.error(f"Lineups notification error for user {subscriber['user_id']}: {e}")
+                                            logger.error(f"Lineups notification error: {e}")
                             else:
-                                links = generate_match_links(match_id, data['home'], data['away'], data['league_code'])
-                                msg = f"📋 **{data['home']} – {data['away']}**\n\n"
-                                msg += "❌ Tarkiblar API orqali e'lon qilinmagan.\n"
-                                msg += "🔗 Quyidagi ishonchli saytlarda tarkiblarni ko‘ring:\n\n"
+                                links = generate_match_links(mid, g['home'], g['away'], g['league'])
+                                msg = f"📋 **{g['home']} – {g['away']}**\n\n❌ Tarkiblar API orqali e'lon qilinmagan.\n🔗 Quyidagi ishonchli saytlarda tarkiblarni ko‘ring:\n\n"
                                 for name, url in links[:4]:
                                     msg += f"• [{name}]({url})\n"
-                                
-                                for subscriber in data["subscribers"]:
-                                    if not subscriber["notified_lineups"]:
+                                for u in g["users"]:
+                                    if not u["nl"]:
                                         try:
-                                            await app.bot.send_message(subscriber["user_id"], msg, parse_mode="Markdown", disable_web_page_preview=True)
-                                            await update_notification_flags(subscriber["user_id"], match_id, lineups=True)
+                                            await app.bot.send_message(u["id"], msg, parse_mode="Markdown", disable_web_page_preview=True)
+                                            await update_notification_flags(u["id"], mid, lineups=True)
                                         except Exception as e:
-                                            logger.error(f"Lineups notification error for user {subscriber['user_id']}: {e}")
-                            
-                            data["notified_lineups_already"] = True
-                        
-                        data["notified_1h_already"] = True
-                
-                # 15 daqiqa qolganda
-                if not data["notified_15m_already"] and any(not s["notified_15m"] for s in data["subscribers"]):
-                    if 10 <= minutes_left <= 20:
-                        links = generate_match_links(match_id, data['home'], data['away'], data['league_code'])
-                        msg = f"⏳ **15 daqiqa qoldi!**\n\n{data['home']} – {data['away']}\n🕒 {data['match_time'].strftime('%d.%m.%Y %H:%M')} UTC+0\n\n"
-                        msg += "🔗 Jonli tarkiblar va statistika:\n\n"
+                                            logger.error(f"Lineups notification error: {e}")
+                            g["nl_flag"] = True
+                # 15 daqiqa
+                if not g["n15_flag"] and any(not u["n15"] for u in g["users"]):
+                    if 10 <= delta <= 20:
+                        links = generate_match_links(mid, g['home'], g['away'], g['league'])
+                        msg = f"⏳ **15 daqiqa qoldi!**\n\n{g['home']} – {g['away']}\n🕒 {g['time'].strftime('%d.%m.%Y %H:%M')} UTC+0\n\n🔗 Jonli tarkiblar va statistika:\n\n"
                         for name, url in links[:5]:
                             msg += f"• [{name}]({url})\n"
-                        
-                        for subscriber in data["subscribers"]:
-                            if not subscriber["notified_15m"]:
+                        for u in g["users"]:
+                            if not u["n15"]:
                                 try:
-                                    await app.bot.send_message(subscriber["user_id"], msg, parse_mode="Markdown", disable_web_page_preview=True)
-                                    await update_notification_flags(subscriber["user_id"], match_id, fifteen_min=True)
+                                    await app.bot.send_message(u["id"], msg, parse_mode="Markdown", disable_web_page_preview=True)
+                                    await update_notification_flags(u["id"], mid, fifteen_min=True)
                                 except Exception as e:
-                                    logger.error(f"15m notification error for user {subscriber['user_id']}: {e}")
-                        
-                        data["notified_15m_already"] = True
-        
+                                    logger.error(f"15m notification error: {e}")
+                        g["n15_flag"] = True
         except Exception as e:
-            logger.exception(f"Notification scheduler error: {e}")
-        
+            logger.exception(f"Scheduler xatosi: {e}")
         await asyncio.sleep(60)
 
 # ========== ADMIN COMMANDS ==========
 async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await is_admin(user.id):
+    u = update.effective_user
+    if not await is_admin(u.id):
         await update.message.reply_text("❌ Siz admin emassiz.")
         return
     if len(context.args) < 2:
         await update.message.reply_text("❌ Ishlatish: `/addanalysis 123456 Matn`", parse_mode="Markdown")
         return
     try:
-        match_id = int(context.args[0])
-        analysis = ' '.join(context.args[1:])
+        mid = int(context.args[0])
+        text = ' '.join(context.args[1:])
     except:
         await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
         return
-
-    await add_analysis(match_id, analysis, user.id)
-    await update.message.reply_text(f"✅ Tahlil qoʻshildi (Match ID: {match_id}).")
-    
-    # Obunachilarga xabar yuborish
-    subscribers = await get_subscribers_for_match(match_id)
-    if subscribers:
-        sent_count = 0
-        for uid in subscribers:
+    await add_analysis(mid, text, u.id)
+    await update.message.reply_text(f"✅ Tahlil qoʻshildi (Match ID: {mid}).")
+    subs = await get_subscribers_for_match(mid)
+    if subs:
+        sent = 0
+        safe = escape_markdown(text, version=2)
+        for sid in subs:
             try:
-                await context.bot.send_message(
-                    uid,
-                    f"📝 **Oʻyin tahlili yangilandi!**\n\n"
-                    f"🆔 Match ID: `{match_id}`\n"
-                    f"📊 **Yangi tahlil:**\n{analysis}\n\n"
-                    f"👇 Tahlilni ko‘rish uchun bosing:",
+                await context.bot.send_message(sid,
+                    f"📝 **Oʻyin tahlili yangilandi!**\n\n🆔 Match ID: `{mid}`\n📊 **Yangi tahlil:**\n{safe}\n\n👇 Tahlilni ko‘rish uchun bosing:",
                     parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{match_id}")]
-                    ])
-                )
-                sent_count += 1
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{mid}")]]))
+                sent += 1
             except Exception as e:
-                logger.error(f"Tahlil bildirishnomasini yuborib boʻlmadi (user {uid}): {e}")
-        await update.message.reply_text(f"📢 {sent_count} ta obunachiga bildirishnoma yuborildi.")
+                logger.error(f"Tahlil bildirishnomasi xatosi (user {sid}): {e}")
+        await update.message.reply_text(f"📢 {sent} ta obunachiga bildirishnoma yuborildi.")
 
 async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await is_admin(user.id):
-        await update.message.reply_text("❌ Siz admin emassiz.")
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("❌ Ishlatish: `/addadmin 123456789`", parse_mode="Markdown")
-        return
-    try:
-        new_admin = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ ID raqam boʻlishi kerak.")
-        return
-    if await is_admin(new_admin):
-        await update.message.reply_text("⚠️ Bu foydalanuvchi allaqachon admin.")
-        return
-    await add_admin(new_admin, user.id)
-    await update.message.reply_text(f"✅ Foydalanuvchi {new_admin} admin qilindi.")
+    u = update.effective_user
+    if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
+    if len(context.args) != 1: return await update.message.reply_text("❌ Ishlatish: `/addadmin 123456789`", parse_mode="Markdown")
+    try: new = int(context.args[0])
+    except: return await update.message.reply_text("❌ ID raqam boʻlishi kerak.")
+    if await is_admin(new): return await update.message.reply_text("⚠️ Bu foydalanuvchi allaqachon admin.")
+    if await add_admin(new, u.id):
+        await update.message.reply_text(f"✅ Foydalanuvchi {new} admin qilindi.")
+    else:
+        await update.message.reply_text("❌ Xatolik yuz berdi.")
 
 async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await is_admin(user.id):
-        await update.message.reply_text("❌ Siz admin emassiz.")
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("❌ Ishlatish: `/removeadmin 123456789`", parse_mode="Markdown")
-        return
-    try:
-        admin_id = int(context.args[0])
-    except:
-        await update.message.reply_text("❌ ID raqam boʻlishi kerak.")
-        return
-    if admin_id == 6935090105:
-        await update.message.reply_text("❌ Asosiy adminni o‘chirib bo‘lmaydi.")
-        return
-    if not await is_admin(admin_id):
-        await update.message.reply_text("⚠️ Bu foydalanuvchi admin emas.")
-        return
-    await remove_admin(admin_id)
-    await update.message.reply_text(f"✅ Admin {admin_id} olib tashlandi.")
+    u = update.effective_user
+    if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
+    if len(context.args) != 1: return await update.message.reply_text("❌ Ishlatish: `/removeadmin 123456789`", parse_mode="Markdown")
+    try: aid = int(context.args[0])
+    except: return await update.message.reply_text("❌ ID raqam boʻlishi kerak.")
+    if aid == 6935090105: return await update.message.reply_text("❌ Asosiy adminni o‘chirib bo‘lmaydi.")
+    if not await is_admin(aid): return await update.message.reply_text("⚠️ Bu foydalanuvchi admin emas.")
+    await remove_admin(aid)
+    await update.message.reply_text(f"✅ Admin {aid} olib tashlandi.")
 
 async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await is_admin(user.id):
-        await update.message.reply_text("❌ Siz admin emassiz.")
-        return
+    u = update.effective_user
+    if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
     admins = await get_all_admins()
-    if not admins:
-        await update.message.reply_text("📭 Adminlar ro'yxati bo'sh.")
-        return
+    if not admins: return await update.message.reply_text("📭 Adminlar ro'yxati bo'sh.")
     text = "👑 **Adminlar:**\n\n"
-    for aid, added_by, added_at in admins:
-        added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
-        text += f"• `{aid}` – qo'shdi: `{added_by}`, {added_at_dt.strftime('%d.%m.%Y')}\n"
+    for aid, added_by, at in admins:
+        dt = datetime.strptime(at, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y")
+        text += f"• `{aid}` – qo'shdi: `{added_by}`, {dt}\n"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def admin_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not await is_admin(user.id):
-        await update.message.reply_text("❌ Siz admin emassiz.")
-        return
+    u = update.effective_user
+    if not await is_admin(u.id): return await update.message.reply_text("❌ Siz admin emassiz.")
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
-            total_users = (await cursor.fetchone())[0]
-        async with db.execute('SELECT COUNT(*) FROM referrals') as cursor:
-            total_refs = (await cursor.fetchone())[0]
-        async with db.execute('SELECT SUM(balance) FROM users') as cursor:
-            total_balance = (await cursor.fetchone())[0] or 0
-        async with db.execute('SELECT COUNT(*) FROM withdrawals WHERE status="completed"') as cursor:
-            total_withdrawals = (await cursor.fetchone())[0]
-        async with db.execute('SELECT SUM(amount) FROM withdrawals WHERE status="completed"') as cursor:
-            total_withdrawn = (await cursor.fetchone())[0] or 0
-    text = (
-        f"📊 **Bot statistikasi**\n\n"
-        f"👥 Foydalanuvchilar: {total_users}\n"
-        f"🔗 Referallar: {total_refs}\n"
-        f"💰 Jami balans: {total_balance:,} soʻm\n"
-        f"💸 Yechimlar soni: {total_withdrawals}\n"
-        f"💵 Jami yechilgan: {total_withdrawn:,} soʻm"
-    )
+        users = (await db.execute("SELECT COUNT(*) FROM users")).fetchone()[0]
+        refs = (await db.execute("SELECT COUNT(*) FROM referrals")).fetchone()[0]
+        bal = (await db.execute("SELECT SUM(balance) FROM users")).fetchone()[0] or 0
+        wd_cnt = (await db.execute("SELECT COUNT(*) FROM withdrawals WHERE status='completed'")).fetchone()[0]
+        wd_sum = (await db.execute("SELECT SUM(amount) FROM withdrawals WHERE status='completed'")).fetchone()[0] or 0
+    text = f"📊 **Bot statistikasi**\n\n👥 Foydalanuvchilar: {users}\n🔗 Referallar: {refs}\n💰 Jami balans: {bal:,} soʻm\n💸 Yechimlar soni: {wd_cnt}\n💵 Jami yechilgan: {wd_sum:,} soʻm"
     await update.message.reply_text(text, parse_mode="Markdown")
 
 async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not FOOTBALL_DATA_KEY:
         await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
-        return
-    await update.message.reply_text("✅ API kaliti mavjud. Tez orada sinovdan o'tadi.")
+    else:
+        await update.message.reply_text("✅ API kaliti mavjud.")
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not FOOTBALL_DATA_KEY:
-        await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
-        return
-    await update.message.reply_text("📊 Debug maʼlumoti: API soʻrovi yuborilmoqda...")
+    await update.message.reply_text("📊 Debug buyrug'i.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Quyidagi chempionatlardan birini tanlang:",
-        reply_markup=get_leagues_keyboard()
-    )
+    await update.message.reply_text("Quyidagi chempionatlardan birini tanlang:", reply_markup=get_leagues_keyboard())
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Optimized + Rate Limit)")
+    return web.Response(text="✅ Bot ishlamoqda (Final version)")
 
 async def run_web_server():
     app = web.Application()
@@ -1124,8 +789,7 @@ async def run_web_server():
     port = int(os.environ.get("PORT", 8080))
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
     logger.info(f"Web server port {port} da ishga tushdi")
 
 # ========== MAIN ==========
@@ -1135,30 +799,27 @@ async def run_bot():
         logger.error("BOT_TOKEN topilmadi!")
         return
     await init_db()
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("test", test_api))
-    application.add_handler(CommandHandler("debug", debug))
-    application.add_handler(CommandHandler("stats", admin_stats_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CommandHandler("addanalysis", add_analysis_command))
-    application.add_handler(CommandHandler("addadmin", add_admin_command))
-    application.add_handler(CommandHandler("removeadmin", remove_admin_command))
-    application.add_handler(CommandHandler("listadmins", list_admins_command))
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Optimized + Rate Limit)")
-    asyncio.create_task(notification_scheduler(application))
+    app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("test", test_api))
+    app.add_handler(CommandHandler("debug", debug))
+    app.add_handler(CommandHandler("stats", admin_stats_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CommandHandler("addanalysis", add_analysis_command))
+    app.add_handler(CommandHandler("addadmin", add_admin_command))
+    app.add_handler(CommandHandler("removeadmin", remove_admin_command))
+    app.add_handler(CommandHandler("listadmins", list_admins_command))
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    logger.info("🤖 Bot ishga tushdi! (Final versiya)")
+    asyncio.create_task(notification_scheduler(app))
     while True:
         await asyncio.sleep(3600)
 
 async def main():
-    await asyncio.gather(
-        run_web_server(),
-        run_bot()
-    )
+    await asyncio.gather(run_web_server(), run_bot())
 
 if __name__ == "__main__":
     asyncio.run(main())
