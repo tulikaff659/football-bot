@@ -2,6 +2,7 @@ import os
 import asyncio
 import logging
 import aiohttp
+import aiosqlite
 from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,9 +30,92 @@ TOP_LEAGUES = {
 }
 
 # Necha kun ichidagi o'yinlar
-DAYS_AHEAD = 7  # 7 kun ichidagi o'yinlar
+DAYS_AHEAD = 7
 
-# ---------- ASOSIY LIGA TUGMALARI ----------
+# ========== MAʼLUMOTLAR BAZASI (SQLite) ==========
+DB_PATH = "data/bot.db"  # Railway volume uchun
+
+async def init_db():
+    """Bazani ishga tushirish – jadvallarni yaratish"""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Adminlar jadvali
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        # Tahlillar jadvali
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS match_analyses (
+                match_id INTEGER PRIMARY KEY,
+                analysis TEXT NOT NULL,
+                added_by INTEGER NOT NULL,
+                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        await db.commit()
+        
+        # Asosiy adminni qo'shish (agar mavjud bo'lmasa)
+        MAIN_ADMIN = 6935090105
+        async with db.execute('SELECT user_id FROM admins WHERE user_id = ?', (MAIN_ADMIN,)) as cursor:
+            admin = await cursor.fetchone()
+            if not admin:
+                await db.execute('INSERT INTO admins (user_id, added_by) VALUES (?, ?)', (MAIN_ADMIN, MAIN_ADMIN))
+                await db.commit()
+                logger.info(f"Asosiy admin qo'shildi: {MAIN_ADMIN}")
+
+async def is_admin(user_id: int) -> bool:
+    """Foydalanuvchi admin ekanligini tekshirish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT 1 FROM admins WHERE user_id = ?', (user_id,)) as cursor:
+            return await cursor.fetchone() is not None
+
+async def add_admin(user_id: int, added_by: int) -> bool:
+    """Yangi admin qo'shish"""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute('INSERT INTO admins (user_id, added_by) VALUES (?, ?)', (user_id, added_by))
+            await db.commit()
+            return True
+    except:
+        return False
+
+async def remove_admin(user_id: int) -> bool:
+    """Adminni olib tashlash"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('DELETE FROM admins WHERE user_id = ?', (user_id,))
+        await db.commit()
+        return True
+
+async def get_all_admins():
+    """Barcha adminlar ro'yxatini olish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT user_id, added_by, added_at FROM admins ORDER BY added_at') as cursor:
+            return await cursor.fetchall()
+
+async def add_analysis(match_id: int, analysis: str, added_by: int):
+    """O'yin tahlilini saqlash (mavjud bo'lsa yangilash)"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute('''
+            INSERT INTO match_analyses (match_id, analysis, added_by)
+            VALUES (?, ?, ?)
+            ON CONFLICT(match_id) DO UPDATE SET
+                analysis = excluded.analysis,
+                added_by = excluded.added_by,
+                added_at = CURRENT_TIMESTAMP
+        ''', (match_id, analysis, added_by))
+        await db.commit()
+
+async def get_analysis(match_id: int):
+    """O'yin tahlilini olish"""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute('SELECT analysis, added_at FROM match_analyses WHERE match_id = ?', (match_id,)) as cursor:
+            return await cursor.fetchone()
+
+# ---------- INLINE TUGMALAR ----------
 def get_leagues_keyboard():
     """Ligalar ro'yxatini qaytaradi"""
     keyboard = []
@@ -39,9 +123,25 @@ def get_leagues_keyboard():
         keyboard.append([InlineKeyboardButton(data["name"], callback_data=f"league_{league_code}")])
     return InlineKeyboardMarkup(keyboard)
 
-# ---------- O'YINLARNI API ORQALI OLISH ----------
+def build_matches_keyboard(matches, league_code):
+    """O'yinlar ro'yxatidan inline tugmalar yaratish"""
+    keyboard = []
+    for match in matches[:10]:
+        home = match["homeTeam"]["name"]
+        away = match["awayTeam"]["name"]
+        match_date = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
+        tashkent_time = match_date + timedelta(hours=5)
+        date_str = tashkent_time.strftime("%d.%m %H:%M")
+        
+        button_text = f"{home} – {away} ({date_str})"
+        callback_data = f"match_{match['id']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+    
+    keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
+    return InlineKeyboardMarkup(keyboard)
+
+# ---------- API ORQALI OʻYINLARNI OLISH ----------
 async def fetch_matches_by_league(league_code: str):
-    """Berilgan liga kodi bo'yicha o'yinlarni olish"""
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY muhit oʻzgaruvchisida topilmadi!"}
     
@@ -73,31 +173,8 @@ async def fetch_matches_by_league(league_code: str):
         logger.exception("Ulanish xatosi")
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
-# ---------- O'YINLAR UCHUN TUGMALAR YARATISH ----------
-def build_matches_keyboard(matches, league_code):
-    """O'yinlar ro'yxatidan inline tugmalar yaratish"""
-    keyboard = []
-    
-    for match in matches[:10]:  # Eng ko'pi 10 ta o'yin
-        home = match["homeTeam"]["name"]
-        away = match["awayTeam"]["name"]
-        match_date = datetime.strptime(match["utcDate"], "%Y-%m-%dT%H:%M:%SZ")
-        tashkent_time = match_date + timedelta(hours=5)
-        date_str = tashkent_time.strftime("%d.%m %H:%M")
-        
-        # O'yin nomi: "Manchester City – Liverpool (14.02 19:45)"
-        button_text = f"{home} – {away} ({date_str})"
-        callback_data = f"match_{match['id']}"
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
-    
-    # Orqaga qaytish tugmasi
-    keyboard.append([InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")])
-    
-    return InlineKeyboardMarkup(keyboard)
-
 # ---------- TELEGRAM HANDLERLAR ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start komandasi – ligalarni ko'rsatadi"""
     user = update.effective_user
     await update.message.reply_text(
         f"👋 Assalomu alaykum, {user.first_name}!\n"
@@ -106,7 +183,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Barcha inline tugmalar uchun asosiy handler"""
     query = update.callback_query
     await query.answer()
     
@@ -129,21 +205,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ Notoʻgʻri tanlov.")
             return
         
-        # Yuklanayotgan xabar
         await query.edit_message_text(f"⏳ {league_info['name']} – oʻyinlar yuklanmoqda...")
-        
-        # API dan ma'lumot olish
         result = await fetch_matches_by_league(league_code)
         
         if "error" in result:
-            await query.edit_message_text(
-                result["error"],
-                reply_markup=get_leagues_keyboard()
-            )
+            await query.edit_message_text(result["error"], reply_markup=get_leagues_keyboard())
             return
         
         matches = result["success"]
-        
         if not matches:
             await query.edit_message_text(
                 f"⚽ {league_info['name']}\n{DAYS_AHEAD} kun ichida oʻyinlar yoʻq.",
@@ -151,7 +220,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         
-        # O'yinlar ro'yxatini tugmalar shaklida ko'rsatish
         keyboard = build_matches_keyboard(matches, league_code)
         await query.edit_message_text(
             f"🏆 **{league_info['name']}** – {DAYS_AHEAD} kun ichidagi oʻyinlar:\n\n"
@@ -162,30 +230,144 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # -------------------- O'YIN TANLASH --------------------
     elif data.startswith("match_"):
-        match_id = data.split("_")[1]
+        match_id = int(data.split("_")[1])
         
-        # Hozircha oddiy xabar – keyinroq tahlil qo'shiladi
-        await query.edit_message_text(
-            f"⚽ **O'yin tahlili**\n\n"
-            f"🆔 Match ID: `{match_id}`\n"
-            f"📊 Ma'lumot yig'ilmoqda...\n\n"
-            f"⏳ Ekspertlar tahlili, kutilayotgan tarkib va bashoratlar tez orada qoʻshiladi.",
-            parse_mode="Markdown"
-        )
+        # Tahlilni bazadan olish
+        analysis_row = await get_analysis(match_id)
         
-        # ORQAGA QAYTISH UCHUN – bu xabardan keyin foydalanuvchi orqaga qaytishi kerak
-        # Qulaylik uchun "🔙 Back to Leagues" tugmasini qo'shamiz
-        keyboard = InlineKeyboardMarkup([
+        if analysis_row:
+            analysis_text, added_at = analysis_row
+            added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
+            date_str = added_at_dt.strftime("%d.%m.%Y %H:%M")
+            
+            message = (
+                f"⚽ **Oʻyin tahlili**\n\n"
+                f"🆔 Match ID: `{match_id}`\n"
+                f"📝 **Tahlil:**\n{analysis_text}\n\n"
+                f"🕐 Qoʻshilgan sana: {date_str}"
+            )
+        else:
+            message = (
+                f"⚽ **Oʻyin tahlili**\n\n"
+                f"🆔 Match ID: `{match_id}`\n"
+                f"📊 Hozircha bu oʻyin uchun tahlil mavjud emas.\n\n"
+            )
+            # Agar admin bo'lsa, tahlil qo'shish buyrug'ini eslatish
+            if await is_admin(update.effective_user.id):
+                message += f"💡 Admin: `/addanalysis {match_id} <tahlil matni>` buyrugʻi bilan tahlil qoʻshishingiz mumkin."
+        
+        await query.edit_message_text(message, parse_mode="Markdown")
+        
+        # Orqaga qaytish tugmasi
+        back_keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔙 Back to Leagues", callback_data="leagues")]
         ])
-        await query.message.reply_text(
-            "Boshqa ligaga oʻtish:",
-            reply_markup=keyboard
-        )
+        await query.message.reply_text("Boshqa ligaga oʻtish:", reply_markup=back_keyboard)
 
-# ---------- YORDAMCHI BUYRUQLAR (TEST, DEBUG) ----------
+# ---------- ADMIN BUYRUQLARI ----------
+async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ /addanalysis <match_id> <tahlil matni> """
+    user = update.effective_user
+    if not await is_admin(user.id):
+        await update.message.reply_text("❌ Siz admin emassiz. Bu buyruq faqat adminlar uchun.")
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "❌ Notoʻgʻri format. Ishlatish:\n"
+            "`/addanalysis 123456 Manchester City hujumda kuchli...`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    try:
+        match_id = int(context.args[0])
+        analysis_text = ' '.join(context.args[1:])
+    except ValueError:
+        await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
+        return
+    
+    await add_analysis(match_id, analysis_text, user.id)
+    await update.message.reply_text(f"✅ Tahlil muvaffaqiyatli qoʻshildi (Match ID: {match_id}).")
+
+async def add_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ /addadmin <user_id> """
+    user = update.effective_user
+    if not await is_admin(user.id):
+        await update.message.reply_text("❌ Siz admin emassiz. Bu buyruq faqat adminlar uchun.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ Ishlatish: `/addadmin 123456789`", parse_mode="Markdown")
+        return
+    
+    try:
+        new_admin_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ User ID raqam boʻlishi kerak.")
+        return
+    
+    if await is_admin(new_admin_id):
+        await update.message.reply_text("⚠️ Bu foydalanuvchi allaqachon admin.")
+        return
+    
+    success = await add_admin(new_admin_id, user.id)
+    if success:
+        await update.message.reply_text(f"✅ Foydalanuvchi {new_admin_id} admin qilindi.")
+    else:
+        await update.message.reply_text("❌ Xatolik yuz berdi.")
+
+async def remove_admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ /removeadmin <user_id> """
+    user = update.effective_user
+    if not await is_admin(user.id):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return
+    
+    if len(context.args) != 1:
+        await update.message.reply_text("❌ Ishlatish: `/removeadmin 123456789`", parse_mode="Markdown")
+        return
+    
+    try:
+        admin_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ User ID raqam boʻlishi kerak.")
+        return
+    
+    # Asosiy adminni o'chirib bo'lmaydi
+    if admin_id == 6935090105:
+        await update.message.reply_text("❌ Asosiy adminni o'chirib bo'lmaydi.")
+        return
+    
+    if not await is_admin(admin_id):
+        await update.message.reply_text("⚠️ Bu foydalanuvchi admin emas.")
+        return
+    
+    await remove_admin(admin_id)
+    await update.message.reply_text(f"✅ Foydalanuvchi {admin_id} adminlikdan olib tashlandi.")
+
+async def list_admins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ /listadmins """
+    user = update.effective_user
+    if not await is_admin(user.id):
+        await update.message.reply_text("❌ Siz admin emassiz.")
+        return
+    
+    admins = await get_all_admins()
+    if not admins:
+        await update.message.reply_text("📭 Adminlar ro'yxati bo'sh.")
+        return
+    
+    text = "👑 **Adminlar ro'yxati:**\n\n"
+    for admin_id, added_by, added_at in admins:
+        added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
+        date_str = added_at_dt.strftime("%d.%m.%Y")
+        text += f"• `{admin_id}` – qo'shdi: `{added_by}`, sana: {date_str}\n"
+    
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+# ---------- TEST / DEBUG BUYRUQLARI ----------
 async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """API kaliti va ulanishni tekshiradi"""
     if not FOOTBALL_DATA_KEY:
         await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
         return
@@ -204,7 +386,6 @@ async def test_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Ulanish xatosi: {type(e).__name__}")
 
 async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """API javobini toʻliq koʻrsatadi (Premyer Liga misolida)"""
     if not FOOTBALL_DATA_KEY:
         await update.message.reply_text("❌ FOOTBALL_DATA_KEY topilmadi!")
         return
@@ -237,7 +418,6 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ Xatolik: {type(e).__name__}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Har qanday matnli xabarga javob"""
     await update.message.reply_text(
         "Quyidagi chempionatlardan birini tanlang:",
         reply_markup=get_leagues_keyboard()
@@ -245,7 +425,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- WEB SERVER (Railway uchun) ----------
 async def health_check(request):
-    return web.Response(text="✅ Football-Data.org bot ishlamoqda (2 bosqichli tanlov)")
+    return web.Response(text="✅ Bot ishlamoqda (Admin panel qo'shilgan)")
 
 async def run_web_server():
     app = web.Application()
@@ -264,17 +444,28 @@ async def run_bot():
         logger.error("BOT_TOKEN topilmadi!")
         return
     
+    # Bazani ishga tushirish
+    await init_db()
+    
     application = Application.builder().token(token).build()
+    
+    # Asosiy handlerlar
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_api))
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CallbackQueryHandler(button_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
+    # Admin handlerlar
+    application.add_handler(CommandHandler("addanalysis", add_analysis_command))
+    application.add_handler(CommandHandler("addadmin", add_admin_command))
+    application.add_handler(CommandHandler("removeadmin", remove_admin_command))
+    application.add_handler(CommandHandler("listadmins", list_admins_command))
+    
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Football-Data.org, 7 kunlik oʻyinlar, tahlil uchun tayyor)")
+    logger.info("🤖 Bot ishga tushdi! (Admin panel faol)")
     
     while True:
         await asyncio.sleep(3600)
