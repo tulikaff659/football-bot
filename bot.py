@@ -5,6 +5,7 @@ import aiohttp
 import aiosqlite
 import random
 import time
+import re
 from datetime import datetime, timedelta, date
 from aiohttp import web
 from urllib.parse import quote
@@ -422,7 +423,6 @@ def build_match_detail_keyboard(mid, is_subscribed=False, lineups_available=Fals
         kb.append([InlineKeyboardButton("🔕 Kuzatishni bekor qilish", callback_data=f"unsubscribe_{mid}")])
     else:
         kb.append([InlineKeyboardButton("🔔 Kuzatish", callback_data=f"subscribe_{mid}")])
-    # Tahlil URL tugmasi (agar mavjud bo'lsa)
     if analysis_url:
         kb.append([InlineKeyboardButton("🔗 To‘liq tahlil", url=analysis_url)])
     kb.append([InlineKeyboardButton("📰 Futbol yangiliklari", url="https://t.me/ai_futinside"),
@@ -720,47 +720,69 @@ async def add_analysis_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not await is_admin(u.id):
         await update.message.reply_text("❌ Siz admin emassiz.")
         return
+    
     if len(context.args) < 2:
-        await update.message.reply_text("❌ Ishlatish: `/addanalysis <match_id> <tahlil matni> [url]`", parse_mode="Markdown")
-        return
-    try:
-        mid = int(context.args[0])
-        # Qolgan argumentlar: matn va ixtiyoriy URL
-        # URL bo'lsa, u qolgan oxirgi argument bo'lishi kerak
-        # Agar oxirgi argument http:// yoki https:// bilan boshlansa, uni URL deb olamiz
-        if len(context.args) >= 3 and (context.args[-1].startswith("http://") or context.args[-1].startswith("https://")):
-            url = context.args[-1]
-            text = ' '.join(context.args[1:-1])
-        else:
-            url = None
-            text = ' '.join(context.args[1:])
-    except Exception as e:
-        await update.message.reply_text(f"❌ Xatolik: {e}")
+        await update.message.reply_text(
+            "❌ Ishlatish:\n`/addanalysis <match_id> <tahlil matni> [ixtiyoriy URL]`\n\n"
+            "URL `http://` yoki `https://` bilan boshlanishi kerak va istalgan joyda yozilishi mumkin.\n"
+            "Misol: `/addanalysis 123456 Arsenal favorit! https://t.me/ai_futinside/29`",
+            parse_mode="Markdown"
+        )
         return
 
-    await add_analysis(mid, text, url, u.id)
-    reply_msg = f"✅ Tahlil qoʻshildi (Match ID: {mid})."
+    try:
+        match_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Match ID raqam boʻlishi kerak.")
+        return
+
+    # URL ni barcha argumentlar ichidan qidirish
+    url_pattern = r'https?://[^\s]+'
+    args_list = context.args[1:]
+    url = None
+    text_parts = []
+    
+    for arg in args_list:
+        if re.match(url_pattern, arg):
+            url = arg
+        else:
+            text_parts.append(arg)
+    
+    text = ' '.join(text_parts)
+    
+    if not text:
+        await update.message.reply_text("❌ Tahlil matni boʻsh boʻlishi mumkin emas.")
+        return
+
+    # Bazaga yozish
+    await add_analysis(match_id, text, url, u.id)
+    
+    reply_msg = f"✅ Tahlil qoʻshildi (Match ID: {match_id})."
     if url:
         reply_msg += f"\n🔗 Havola: {url}"
     await update.message.reply_text(reply_msg, parse_mode="Markdown")
     
     # Obunachilarga xabar yuborish
-    subs = await get_subscribers_for_match(mid)
+    subs = await get_subscribers_for_match(match_id)
     if subs:
         sent = 0
         safe_text = escape_markdown(text, version=2)
-        # Tugmalar: tahlilni ko'rish (callback) va to'liq tahlil (URL)
-        buttons = [[InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{mid}")]]
+        # Tugmalar
+        buttons = [[InlineKeyboardButton("📋 Tahlilni ko‘rish", callback_data=f"match_{match_id}")]]
         if url:
             buttons.append([InlineKeyboardButton("🔗 To‘liq tahlil", url=url)])
         keyboard = InlineKeyboardMarkup(buttons)
         
         for sid in subs:
             try:
-                await context.bot.send_message(sid,
-                    f"📝 **Oʻyin tahlili yangilandi!**\n\n🆔 Match ID: `{mid}`\n📊 **Yangi tahlil:**\n{safe_text}",
+                await context.bot.send_message(
+                    sid,
+                    f"📝 **Oʻyin tahlili yangilandi!**\n\n"
+                    f"🆔 Match ID: `{match_id}`\n"
+                    f"📊 **Yangi tahlil:**\n{safe_text}",
                     parse_mode="Markdown",
-                    reply_markup=keyboard)
+                    reply_markup=keyboard
+                )
                 sent += 1
             except Exception as e:
                 logger.error(f"Tahlil bildirishnomasi xatosi (user {sid}): {e}")
@@ -831,7 +853,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Full fixed version + analysis URL button)")
+    return web.Response(text="✅ Bot ishlamoqda (Full version + URL button fixed)")
 
 async def run_web_server():
     app = web.Application()
@@ -863,7 +885,7 @@ async def run_bot():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Full fixed version + analysis URL button)")
+    logger.info("🤖 Bot ishga tushdi! (Full version + URL button fixed)")
     asyncio.create_task(notification_scheduler(app))
     while True:
         await asyncio.sleep(3600)
