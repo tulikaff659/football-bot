@@ -424,10 +424,10 @@ def format_links_message(links):
         msg += f"• [{name}]({url})\n"
     return msg
 
-# ========== CHIROYLI TAHLIL SHABLONI ==========
+# ========== CHIROYLI TAHLIL SHABLONI (ITALIC + EMOJI) ==========
 def format_analysis_message(match_id, home_team, away_team, match_time, match_status, analysis_text, added_date):
     """
-    Tahlil matnini chiroyli, emoji va qalin shriftlar bilan formatlaydi.
+    Tahlil matnini chiroyli, emoji va qiya (italic) shriftlar bilan formatlaydi.
     """
     status_map = {
         "SCHEDULED": "⏳ Kutilmoqda",
@@ -447,6 +447,9 @@ def format_analysis_message(match_id, home_team, away_team, match_time, match_st
     except:
         formatted_time = match_time
     
+    # PROGNOZ & TAHLIL – qiya (italic) va 💡 emoji bilan
+    italic_analysis = f"💡 _{analysis_text}_" if analysis_text else ""
+    
     msg = (
         f"⚽ **OʻYIN TAHLILI**\n\n"
         f"🏆 **{home_team}** 🆚 **{away_team}**\n"
@@ -454,7 +457,7 @@ def format_analysis_message(match_id, home_team, away_team, match_time, match_st
         f"📊 **Holat:** {status_text}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"📋 **PROGNOZ & TAHLIL:**\n"
-        f"{analysis_text}\n\n"
+        f"{italic_analysis}\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
         f"🕐 **Tahlil qoʻshilgan:** {added_date}\n"
         f"🆔 **Match ID:** `{match_id}`"
@@ -647,7 +650,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             added_at_dt = datetime.strptime(added_at, "%Y-%m-%d %H:%M:%S")
             added_date_str = added_at_dt.strftime("%d.%m.%Y %H:%M")
             safe_text = escape_markdown(text, version=2)
-            # Chiroyli shablonda xabar yaratish
+            # Chiroyli shablon – italic va emoji
             msg = format_analysis_message(
                 mid, home, away, match_time_str, match_status,
                 safe_text, added_date_str
@@ -1015,7 +1018,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Chiroyli tahlil shabloni)")
+    return web.Response(text="✅ Bot ishlamoqda (Chiroyli tahlil + Italic)")
 
 async def run_web_server():
     app = web.Application()
@@ -1049,7 +1052,7 @@ async def run_bot():
     await app.initialize()
     await app.start()
     await app.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Chiroyli tahlil shabloni)")
+    logger.info("🤖 Bot ishga tushdi! (Chiroyli tahlil + Italic)")
     asyncio.create_task(notification_scheduler(app))
     while True:
         await asyncio.sleep(3600)
