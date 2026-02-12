@@ -35,6 +35,7 @@ DB_PATH = "data/bot.db"
 
 # ========== MAʼLUMOTLAR BAZASI ==========
 async def init_db():
+    """Bazani ishga tushirish – jadvallarni yaratish"""
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         # Adminlar jadvali
@@ -167,6 +168,7 @@ async def update_notification_flags(user_id: int, match_id: int, one_hour: bool 
 
 # ========== API CALLS ==========
 async def fetch_matches_by_league(league_code: str):
+    """Liga bo'yicha o'yinlar ro'yxatini olish"""
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
     today = datetime.now().strftime("%Y-%m-%d")
@@ -190,6 +192,7 @@ async def fetch_matches_by_league(league_code: str):
         return {"error": f"❌ Ulanish xatosi: {type(e).__name__}"}
 
 async def fetch_match_by_id(match_id: int):
+    """Bitta o'yin ma'lumotini olish"""
     if not FOOTBALL_DATA_KEY:
         return {"error": "❌ FOOTBALL_DATA_KEY topilmadi!"}
     try:
@@ -197,7 +200,7 @@ async def fetch_match_by_id(match_id: int):
             async with session.get(f"{FOOTBALL_DATA_URL}/matches/{match_id}", headers=HEADERS) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    return {"success": data}
+                    return {"success": data}  # ✅ data = o'yin obyekti (to'g'ri)
                 else:
                     return {"error": f"❌ API xatolik: {resp.status}"}
     except Exception as e:
@@ -314,7 +317,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(msg, parse_mode="Markdown", reply_markup=keyboard)
         return
 
-    # ---------- Obuna bo'lish ----------
+    # ---------- Obuna bo'lish (TUZATILGAN) ----------
     if data.startswith("subscribe_"):
         match_id = int(data.split("_")[1])
         
@@ -324,10 +327,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Xatolik yuz berdi", show_alert=True)
             return
         
+        # ✅ MUHIM TUZATISH: match obyekti to'g'ridan-to'g'ri
         match = result["success"]
-        home = match["match"]["homeTeam"]["name"]
-        away = match["match"]["awayTeam"]["name"]
-        match_time = match["match"]["utcDate"]
+        home = match["homeTeam"]["name"]      # to'g'ri
+        away = match["awayTeam"]["name"]      # to'g'ri
+        match_time = match["utcDate"]         # to'g'ri
 
         # Bazaga obunani yozish
         await subscribe_user(user_id, match_id, match_time, home, away)
@@ -494,7 +498,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== WEB SERVER (RAILWAY UCHUN) ==========
 async def health_check(request):
-    return web.Response(text="✅ Bot ishlamoqda (Kuzatish tugmasi holati oʻzgaradi)")
+    return web.Response(text="✅ Bot ishlamoqda (Kuzatish tugmasi toʻliq tuzatilgan)")
 
 async def run_web_server():
     app = web.Application()
@@ -532,7 +536,7 @@ async def run_bot():
     await application.initialize()
     await application.start()
     await application.updater.start_polling()
-    logger.info("🤖 Bot ishga tushdi! (Kuzatish tugmasi holati oʻzgaradi)")
+    logger.info("🤖 Bot ishga tushdi! (Kuzatish tugmasi toʻliq tuzatilgan)")
 
     # Notifikatsiya schedulerini ishga tushirish
     asyncio.create_task(notification_scheduler(application))
